@@ -496,24 +496,32 @@ class RiseRest:
                 raise RiseRestError(r.status, msg or f"HTTP {r.status}", data)
             return data
 
+    @staticmethod
+    def _unwrap(resp: dict) -> dict:
+        """Rise wraps every REST response in {'data': {...}, 'request_id': '...'}.
+        Strip the envelope so callers can read fields directly."""
+        if isinstance(resp, dict) and isinstance(resp.get("data"), dict):
+            return resp["data"]
+        return resp
+
     # ---- market metadata ---------------------------------------------
     async def get_markets(self) -> dict:
-        return await self._get("/v1/markets")
+        return self._unwrap(await self._get("/v1/markets"))
 
     async def get_eip712_domain(self) -> dict:
-        return await self._get("/v1/auth/eip712-domain")
+        return self._unwrap(await self._get("/v1/auth/eip712-domain"))
 
     # ---- account ----------------------------------------------------
     async def get_portfolio(self, account: str | None = None) -> dict:
         params = {"account": account} if account else None
-        return await self._get("/v1/portfolio/details", params=params)
+        return self._unwrap(await self._get("/v1/portfolio/details", params=params))
 
     async def get_open_orders(self, account: str | None = None,
                                 market_id: int | None = None) -> dict:
         params: dict[str, Any] = {}
         if account: params["account"] = account
         if market_id is not None: params["market_id"] = market_id
-        return await self._get("/v1/orders/open", params=params or None)
+        return self._unwrap(await self._get("/v1/orders/open", params=params or None))
 
     # ---- orders -----------------------------------------------------
     async def place_order(self, *, market_id: int, side: int,
