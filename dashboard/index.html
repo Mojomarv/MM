@@ -1,0 +1,796 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<meta http-equiv="Cache-Control" content="no-store, no-cache, must-revalidate" />
+<meta http-equiv="Pragma" content="no-cache" />
+<meta http-equiv="Expires" content="0" />
+<title>OndoPerps · MM Console</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500;600&display=swap">
+<style>
+:root {
+  --bg:        #0a0d12;
+  --bg-elev:   #11151c;
+  --bg-elev-2: #1a1f29;
+  --bg-input:  #070a0f;
+  --line:      #232936;
+  --line-soft: #1a1f29;
+  --text:      #e8ecf2;
+  --text-2:    #aab0bd;
+  --text-3:    #6a7180;
+  --text-4:    #444a57;
+  --accent:    #5b8cff;
+  --accent-soft: rgba(91, 140, 255, 0.13);
+  --ok:        #4ade80;
+  --bad:       #ef4444;
+  --warn:      #f59e0b;
+  --info:      #38bdf8;
+  --radius:    8px;
+  --radius-sm: 4px;
+  --row:       32px;
+}
+* { box-sizing: border-box; }
+html, body { height: 100%; }
+body {
+  margin: 0; background: var(--bg); color: var(--text);
+  font-family: "Geist", ui-sans-serif, -apple-system, "Segoe UI", sans-serif;
+  font-size: 13px; line-height: 1.45; -webkit-font-smoothing: antialiased;
+}
+.mono, code, .num {
+  font-family: "Geist Mono", ui-monospace, "SF Mono", Menlo, monospace;
+  font-variant-numeric: tabular-nums;
+}
+button {
+  font: inherit; cursor: pointer; user-select: none;
+  border: 1px solid var(--line); border-radius: var(--radius-sm);
+  background: var(--bg-elev); color: var(--text);
+  padding: 6px 14px; transition: all 120ms;
+}
+button:hover:not(:disabled) { border-color: var(--accent); background: var(--accent-soft); }
+button:disabled { opacity: 0.4; cursor: not-allowed; }
+button.primary { background: var(--accent); color: #0a0d12; border-color: var(--accent); font-weight: 600; }
+button.primary:hover:not(:disabled) { background: #7aa2ff; }
+button.danger  { color: var(--bad); border-color: var(--bad); }
+button.danger:hover:not(:disabled)  { background: rgba(239, 68, 68, 0.13); }
+button.warn    { color: var(--warn); border-color: var(--warn); }
+input[type=text], input[type=number] {
+  font: inherit; background: var(--bg-input); color: var(--text);
+  border: 1px solid var(--line); border-radius: var(--radius-sm);
+  padding: 6px 10px;
+}
+input:focus { outline: none; border-color: var(--accent); }
+
+/* layout ------------------------------------------------------------ */
+.app { display: flex; flex-direction: column; height: 100vh; }
+.topbar {
+  display: flex; align-items: center; gap: 16px;
+  padding: 12px 20px; background: var(--bg-elev);
+  border-bottom: 1px solid var(--line);
+}
+.topbar h1 { font-size: 14px; font-weight: 600; margin: 0; letter-spacing: 0.3px; }
+.topbar .badge {
+  font-size: 11px; padding: 2px 8px; border-radius: 999px;
+  background: var(--bg-elev-2); color: var(--text-2);
+  border: 1px solid var(--line);
+}
+.topbar .spacer { flex: 1; }
+.topbar .actions { display: flex; gap: 8px; }
+.status-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+.status-dot.online  { background: var(--ok);   box-shadow: 0 0 6px var(--ok); }
+.status-dot.offline { background: var(--bad); }
+.status-dot.paused  { background: var(--warn); }
+.last-update { color: var(--text-3); font-size: 11px; }
+
+/* content ----------------------------------------------------------- */
+.content {
+  flex: 1; overflow: auto; padding: 16px 20px;
+  display: flex; flex-direction: column; gap: 16px;
+  min-width: 0;
+}
+
+/* Two-column row for panels that can sit side-by-side on wide screens.
+   Collapses to a single column under 1200px so narrow displays still
+   read top-to-bottom. */
+.row-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+  min-width: 0;
+}
+@media (max-width: 1200px) {
+  .row-grid { grid-template-columns: 1fr; }
+}
+.row-grid > section { min-width: 0; }   /* let grid items shrink */
+
+/* Make a panel internally scrollable with a sticky header */
+.panel.scrollable {
+  display: flex; flex-direction: column;
+  max-height: var(--scroll-max, 55vh);
+}
+.panel.scrollable .panel-head { flex-shrink: 0; }
+.panel.scrollable .scroll-body { overflow: auto; flex: 1 1 auto; }
+.panel.scrollable thead th {
+  position: sticky; top: 0; z-index: 2;
+  background: var(--bg-elev);   /* opaque so rows don't show through */
+}
+
+/* Tune panel: lay the rows out in two columns of label+input pairs on
+   wide screens so the panel doesn't grow 12 rows tall. */
+.tune-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0 24px;
+}
+@media (max-width: 900px) {
+  .tune-grid { grid-template-columns: 1fr; }
+}
+.tune-row {
+  display: grid;
+  grid-template-columns: minmax(160px, 1fr) 100px 90px;
+  gap: 10px; align-items: center;
+  padding: 6px 14px;
+  border-bottom: 1px solid var(--line-soft);
+}
+.tune-row:last-child { border-bottom: 0; }
+.tune-row .tune-label { color: var(--text-2); font-size: 12px; }
+.tune-row input {
+  width: 100%; padding: 5px 9px; font-size: 12px;
+  background: var(--bg-input); color: var(--text);
+  border: 1px solid var(--line); border-radius: var(--radius-sm);
+  font-family: "Geist Mono", ui-monospace, monospace;
+}
+.tune-row .tune-hint {
+  font-family: "Geist Mono", ui-monospace, monospace;
+  font-size: 11px; color: var(--text-3); white-space: nowrap;
+  text-align: right;
+}
+.tune-row .tune-hint.changed { color: var(--warn); }
+
+/* kpi cards --------------------------------------------------------- */
+.kpis {
+  display: grid; gap: 12px;
+  grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+}
+.kpi {
+  background: var(--bg-elev); border: 1px solid var(--line);
+  border-radius: var(--radius); padding: 12px 14px;
+}
+.kpi .label { font-size: 11px; color: var(--text-3); text-transform: uppercase; letter-spacing: 0.6px; }
+.kpi .value { font-size: 22px; font-weight: 600; margin-top: 4px; }
+.kpi .sub   { font-size: 11px; color: var(--text-3); margin-top: 2px; }
+.kpi .value.ok  { color: var(--ok); }
+.kpi .value.bad { color: var(--bad); }
+
+/* banner ------------------------------------------------------------ */
+.banner {
+  padding: 10px 14px; border-radius: var(--radius);
+  display: flex; align-items: center; gap: 10px;
+}
+.banner.halt   { background: rgba(245, 158, 11, 0.13); border: 1px solid var(--warn); color: var(--warn); }
+.banner.error  { background: rgba(239, 68, 68, 0.13);  border: 1px solid var(--bad);  color: var(--bad); }
+.banner.info   { background: var(--accent-soft); border: 1px solid var(--accent); color: var(--accent); }
+
+/* table panels ----------------------------------------------------- */
+.panel {
+  background: var(--bg-elev); border: 1px solid var(--line);
+  border-radius: var(--radius); overflow: hidden;
+}
+.panel-head {
+  display: flex; align-items: center; gap: 12px;
+  padding: 10px 14px; border-bottom: 1px solid var(--line-soft);
+  background: var(--bg-elev-2);
+}
+.panel-head h2 { font-size: 12px; font-weight: 600; margin: 0;
+                 text-transform: uppercase; letter-spacing: 0.6px;
+                 color: var(--text-2); }
+.panel-head .count { font-size: 11px; color: var(--text-3); }
+.panel-head .spacer { flex: 1; }
+
+table { width: 100%; border-collapse: collapse; font-size: 12px; }
+thead th {
+  text-align: left; padding: 8px 14px;
+  color: var(--text-3); font-weight: 500;
+  font-size: 10px; text-transform: uppercase; letter-spacing: 0.6px;
+  border-bottom: 1px solid var(--line-soft);
+  background: var(--bg-elev);
+}
+tbody td {
+  padding: 7px 14px; border-bottom: 1px solid var(--line-soft);
+}
+tbody tr:hover { background: var(--bg-elev-2); }
+tbody tr:last-child td { border-bottom: 0; }
+.num         { text-align: right; }
+.pos-positive { color: var(--ok); }
+.pos-negative { color: var(--bad); }
+.dim          { color: var(--text-3); }
+.halt-cell    { color: var(--warn); font-size: 11px; }
+
+/* fills tape -------------------------------------------------------- */
+.fills-list {
+  max-height: 280px; overflow: auto;
+  padding: 4px 0;
+}
+.fill-row {
+  display: grid; grid-template-columns: 80px 110px 60px 1fr 1fr;
+  gap: 10px; padding: 4px 14px; font-size: 11.5px;
+}
+.fill-row .side-buy  { color: var(--ok); font-weight: 600; }
+.fill-row .side-sell { color: var(--bad); font-weight: 600; }
+
+/* skeletons --------------------------------------------------------- */
+.skeleton { color: var(--text-4); font-style: italic; }
+</style>
+</head>
+<body>
+<div class="app">
+
+<!-- topbar ---------------------------------------------------------- -->
+<header class="topbar">
+  <h1>OndoPerps · MM Console</h1>
+  <span class="badge" id="venueBadge">ondo1</span>
+  <span><span class="status-dot offline" id="statusDot"></span>
+        <span id="statusText" style="margin-left:6px">disconnected</span></span>
+  <span class="last-update mono" id="lastUpdate">—</span>
+  <div class="spacer"></div>
+  <div class="actions">
+    <button id="btnStart"  class="primary" disabled>▶ Start</button>
+    <button id="btnStop"   class="warn"    disabled>■ Stop</button>
+    <button id="btnCancel"                 disabled>Cancel orders</button>
+    <button id="btnClose"  class="danger"  disabled>✕ Close + flatten</button>
+  </div>
+</header>
+
+<!-- content --------------------------------------------------------- -->
+<main class="content">
+
+  <!-- top banner: halt / error -->
+  <div id="banner" style="display:none"></div>
+
+  <!-- kpi cards -->
+  <section class="kpis">
+    <div class="kpi"><div class="label">Equity</div>
+      <div class="value mono" id="kEquity">—</div>
+      <div class="sub mono" id="kEquityAvail">—</div></div>
+    <div class="kpi"><div class="label">Session PnL</div>
+      <div class="value mono" id="kSessPnl">—</div>
+      <div class="sub mono" id="kSessFromStart">—</div></div>
+    <div class="kpi"><div class="label">Realized (all)</div>
+      <div class="value mono" id="kRealizedAll">—</div>
+      <div class="sub mono" id="kFills">— fills</div></div>
+    <div class="kpi"><div class="label">Unrealized</div>
+      <div class="value mono" id="kUnrealized">—</div>
+      <div class="sub mono">live MTM</div></div>
+    <div class="kpi"><div class="label">Net notional</div>
+      <div class="value mono" id="kNetNotional">—</div>
+      <div class="sub mono" id="kNetNotionalCap">cap —</div></div>
+    <div class="kpi"><div class="label">Resting orders</div>
+      <div class="value mono" id="kResting">—</div>
+      <div class="sub mono" id="kRestingExpected">of —</div></div>
+  </section>
+
+  <!-- per-pair table — own scroll, sticky header -->
+  <section class="panel scrollable" style="--scroll-max: 50vh">
+    <div class="panel-head">
+      <h2>Per-pair PnL</h2>
+      <span class="count" id="pairsCount">—</span>
+      <div class="spacer"></div>
+      <span class="dim" id="pairsHint">click a column header to sort</span>
+    </div>
+    <div class="scroll-body" style="overflow-x:auto">
+      <table id="pairsTable">
+        <thead><tr>
+          <th data-sort="market">Market</th>
+          <th data-sort="position"   class="num">Position</th>
+          <th data-sort="avg_entry"  class="num">Avg entry</th>
+          <th data-sort="mid"        class="num">Mid</th>
+          <th data-sort="notional"   class="num">Notional</th>
+          <th data-sort="unrealized" class="num">Unreal.</th>
+          <th data-sort="realized_session" class="num">Real. (sess)</th>
+          <th data-sort="realized"   class="num">Real. (all)</th>
+          <th data-sort="bbo_spread" class="num">Sprd&nbsp;bp</th>
+          <th data-sort="halt">Halt</th>
+        </tr></thead>
+        <tbody id="pairsTbody">
+          <tr><td colspan="10" class="skeleton" style="padding:20px;text-align:center">
+            waiting for first /status…
+          </td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- Lower row: live tuning + recent fills side by side on wide screens -->
+  <div class="row-grid">
+
+    <!-- live tuning -->
+    <section class="panel scrollable" style="--scroll-max: 65vh">
+      <div class="panel-head">
+        <h2>Live tuning</h2>
+        <span class="count" id="tuneChangedCount">0 changes pending</span>
+        <div class="spacer"></div>
+        <span class="dim mono" id="tuneSavedMsg"></span>
+      </div>
+      <div class="scroll-body">
+        <div class="tune-grid" id="tuneGrid">
+          <div class="skeleton" style="padding:14px;grid-column:1/-1;text-align:center">
+            waiting for /status…
+          </div>
+        </div>
+      </div>
+      <div style="padding:10px 14px;border-top:1px solid var(--line-soft);
+                  display:flex;gap:8px;align-items:center;flex-shrink:0">
+        <button id="btnSaveTune" class="primary" disabled>Save changes</button>
+        <button id="btnRevertTune" disabled>Revert</button>
+        <span class="dim" style="font-size:11px">
+          Changes apply on the next reconcile tick (≤ 1 s).
+        </span>
+      </div>
+    </section>
+
+    <!-- recent fills -->
+    <section class="panel scrollable" style="--scroll-max: 65vh">
+      <div class="panel-head">
+        <h2>Recent fills</h2>
+        <span class="count" id="fillsCount">—</span>
+      </div>
+      <div class="scroll-body fills-list" id="fillsList" style="max-height:none">
+        <div class="skeleton" style="padding:14px">no fills yet</div>
+      </div>
+    </section>
+
+  </div>
+
+  <!-- config (read-only — pairs, expected orders, trading flag) -->
+  <section class="panel">
+    <div class="panel-head">
+      <h2>Config (read-only)</h2>
+      <div class="spacer"></div>
+      <span class="dim mono" id="configHint">restart needed to change</span>
+    </div>
+    <table>
+      <tbody id="configTbody"></tbody>
+    </table>
+  </section>
+
+</main>
+</div>
+
+<script>
+/* ────────────────────────────────────────────────────────────────── */
+/* config */
+
+// Where the bot's control server listens. Default = same machine,
+// CONTROL_PORT for ondo_mm is 8140 (overridable via env on the bot).
+// To point at a remote host, edit this or pass ?host=... in the URL.
+const params = new URLSearchParams(location.search);
+const HOST   = params.get('host') || '127.0.0.1';
+const PORT   = params.get('port') || '8140';
+const BASE   = `http://${HOST}:${PORT}`;
+const POLL_MS = 2000;
+
+/* ────────────────────────────────────────────────────────────────── */
+/* tiny helpers */
+
+const $  = (id) => document.getElementById(id);
+const fmtUsd = (x, sig=2) => {
+  if (x === null || x === undefined || !isFinite(x)) return '—';
+  const sign = x >= 0 ? '+' : '−';
+  const abs  = Math.abs(x);
+  if (abs >= 1000) return `${x < 0 ? '-' : ''}$${abs.toFixed(0).replace(/\B(?=(\d{3})+(?!\d))/g,',')}`;
+  return `${sign}$${abs.toFixed(sig)}`;
+};
+const fmtUsdRaw = (x) => {
+  if (x === null || x === undefined || !isFinite(x)) return '—';
+  const abs = Math.abs(x);
+  if (abs >= 1000) return `${x < 0 ? '-' : ''}$${abs.toFixed(0).replace(/\B(?=(\d{3})+(?!\d))/g,',')}`;
+  return `${x < 0 ? '-' : ''}$${abs.toFixed(2)}`;
+};
+const fmtNum = (x, digits=4) => {
+  if (x === null || x === undefined || !isFinite(x)) return '—';
+  return x.toFixed(digits);
+};
+const fmtBP = (x) => {
+  if (x === null || x === undefined || !isFinite(x)) return '—';
+  return x.toFixed(1);
+};
+const cls = (x) => x > 0 ? 'pos-positive' : x < 0 ? 'pos-negative' : 'dim';
+const since = (ts) => {
+  if (!ts) return '—';
+  const ms = Date.now() - ts * 1000;
+  if (ms < 0)        return 'just now';
+  if (ms < 1000)     return 'just now';
+  if (ms < 60000)    return `${Math.floor(ms/1000)}s ago`;
+  if (ms < 3600000)  return `${Math.floor(ms/60000)}m ago`;
+  return `${Math.floor(ms/3600000)}h ago`;
+};
+
+/* ────────────────────────────────────────────────────────────────── */
+/* fetch + state */
+
+let lastStatus = null;
+let pollTimer  = null;
+let inflight   = false;
+let sortKey    = 'realized_session';
+let sortDir    = 'asc';   // most negative first
+
+async function pollOnce() {
+  if (inflight) return;
+  inflight = true;
+  try {
+    const r = await fetch(`${BASE}/status`, { cache: 'no-store' });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    lastStatus = await r.json();
+    render(lastStatus);
+    setConnected(true);
+  } catch (err) {
+    setConnected(false);
+  } finally {
+    inflight = false;
+  }
+}
+
+function setConnected(ok) {
+  const dot = $('statusDot');
+  const txt = $('statusText');
+  if (ok && lastStatus) {
+    if (lastStatus.running) {
+      dot.className = 'status-dot online';
+      txt.textContent = 'running';
+    } else {
+      dot.className = 'status-dot paused';
+      txt.textContent = 'paused';
+    }
+    $('btnStart').disabled  = lastStatus.running;
+    $('btnStop').disabled   = !lastStatus.running;
+    $('btnCancel').disabled = false;
+    $('btnClose').disabled  = false;
+  } else {
+    dot.className = 'status-dot offline';
+    txt.textContent = 'disconnected';
+    ['btnStart','btnStop','btnCancel','btnClose'].forEach(id => $(id).disabled = true);
+  }
+}
+
+/* ────────────────────────────────────────────────────────────────── */
+/* render */
+
+function render(s) {
+  $('venueBadge').textContent = (s.venue || 'OndoPerps') + ' · ondo1';
+  $('lastUpdate').textContent = since(s.last_update_ts);
+
+  // banner
+  const bn = $('banner');
+  if (s.halt_reason || s.close && s.close.error) {
+    bn.style.display = 'flex';
+    if (s.close && s.close.error) {
+      bn.className = 'banner error';
+      bn.textContent = `Close error: ${s.close.error}`;
+    } else {
+      bn.className = 'banner halt';
+      bn.textContent = `Halt: ${s.halt_reason || ''} ${s.halt_detail || ''}`;
+    }
+  } else if (s.close && s.close.status === 'closing') {
+    bn.style.display = 'flex';
+    bn.className = 'banner info';
+    bn.textContent = 'Close in progress…';
+  } else {
+    bn.style.display = 'none';
+  }
+
+  // kpi cards
+  const pnl = s.pnl || {};
+  const bal = s.balance || {};
+  const eq  = bal.total;
+  const av  = bal.available;
+  $('kEquity').textContent       = fmtUsdRaw(eq);
+  $('kEquityAvail').textContent  = av != null ? `${fmtUsdRaw(av)} available` : '';
+
+  // Session pnl: prefer ex_pnl source (realized_session_total), else fallback
+  const sess = pnl.realized_session_total;
+  $('kSessPnl').textContent = fmtUsd(sess);
+  $('kSessPnl').className   = `value mono ${cls(sess)}`;
+  $('kSessFromStart').textContent = pnl.session_start_ts
+    ? `since ${new Date(pnl.session_start_ts * 1000).toLocaleTimeString()}`
+    : '';
+
+  $('kRealizedAll').textContent = fmtUsd(pnl.realized_total);
+  $('kRealizedAll').className   = `value mono ${cls(pnl.realized_total)}`;
+  const vol = s.volume || {};
+  $('kFills').textContent = `${vol.total_fills_session ?? '—'} session · ${vol.total_fills ?? '—'} all-time`;
+
+  $('kUnrealized').textContent = fmtUsd(pnl.unrealized_total);
+  $('kUnrealized').className   = `value mono ${cls(pnl.unrealized_total)}`;
+
+  const net = sumNotional(pnl.per_market);
+  $('kNetNotional').textContent = fmtUsdRaw(net);
+  const cap = s.grid && s.grid.max_total_notional;
+  $('kNetNotionalCap').textContent = cap ? `cap $${cap.toLocaleString()}` : 'cap —';
+
+  const resting = sumResting(pnl.per_market, s);
+  $('kResting').textContent = resting.cur != null ? `${resting.cur}` : '—';
+  $('kRestingExpected').textContent = `of ${s.grid?.expected_max_orders ?? '—'} expected`;
+
+  // pairs table
+  renderPairs(s);
+  renderFills(s);
+  renderTune(s);
+  renderConfig(s);
+}
+
+function sumNotional(per_market) {
+  if (!per_market) return null;
+  let t = 0;
+  for (const k in per_market) t += Math.abs(per_market[k].position_value || 0);
+  return t;
+}
+
+function sumResting(per_market, s) {
+  // The bot doesn't put resting count in /status directly. We approximate
+  // it from grid_params.expected_max_orders. Future improvement: have the
+  // bot publish a per-pair levels count.
+  return { cur: null };
+}
+
+function renderPairs(s) {
+  const per = (s.pnl && s.pnl.per_market) || {};
+  const positions = s.positions || {};
+  const bbo = s.last_bbo || {};
+  const markets = s.markets || Object.keys(per);
+
+  let rows = markets.map(m => {
+    const e   = per[m] || {};
+    const b   = bbo[m] || {};
+    const mid = (b.bid && b.ask) ? (b.bid + b.ask) / 2 : null;
+    const sp  = (b.bid && b.ask) ? (b.ask - b.bid) / mid * 10000 : null;
+    const pos = e.position ?? positions[m] ?? 0;
+    return {
+      market:    m,
+      position:  pos,
+      avg_entry: e.avg_entry,
+      mid:       mid,
+      bbo_spread: sp,
+      notional:  e.position_value ?? (pos && mid ? pos * mid : 0),
+      unrealized: e.unrealized_pnl,
+      realized_session: e.realized_session,
+      realized:  e.realized_pnl,
+      halt:      e.halt_reason || '',  // future: bot can publish per-pair halts
+    };
+  });
+
+  // sort
+  rows.sort((a, b) => {
+    const av = a[sortKey], bv = b[sortKey];
+    if (av == null && bv == null) return 0;
+    if (av == null) return 1;
+    if (bv == null) return -1;
+    if (typeof av === 'string') return sortDir === 'asc' ? av.localeCompare(bv) : bv.localeCompare(av);
+    return sortDir === 'asc' ? av - bv : bv - av;
+  });
+
+  $('pairsCount').textContent = `${rows.length} pairs`;
+  const tbody = $('pairsTbody');
+  tbody.innerHTML = rows.map(r => `
+    <tr>
+      <td class="mono">${r.market}</td>
+      <td class="num mono ${cls(r.position)}">${fmtNum(r.position, 4)}</td>
+      <td class="num mono dim">${r.avg_entry ? r.avg_entry.toFixed(4) : '—'}</td>
+      <td class="num mono">${r.mid != null ? r.mid.toFixed(4) : '—'}</td>
+      <td class="num mono dim">${fmtUsdRaw(r.notional)}</td>
+      <td class="num mono ${cls(r.unrealized)}">${fmtUsd(r.unrealized)}</td>
+      <td class="num mono ${cls(r.realized_session)}">${fmtUsd(r.realized_session)}</td>
+      <td class="num mono dim">${fmtUsd(r.realized)}</td>
+      <td class="num mono ${r.bbo_spread != null && r.bbo_spread > 30 ? 'pos-negative' : 'dim'}">${fmtBP(r.bbo_spread)}</td>
+      <td class="halt-cell">${r.halt}</td>
+    </tr>
+  `).join('');
+}
+
+function renderFills(s) {
+  const fills = s.recent_fills || [];
+  $('fillsCount').textContent = `${fills.length}`;
+  const list = $('fillsList');
+  if (!fills.length) {
+    list.innerHTML = `<div class="skeleton" style="padding:14px">no fills yet</div>`;
+    return;
+  }
+  list.innerHTML = fills.slice().reverse().map(f => {
+    const d = f.ts ? new Date(f.ts * 1000).toLocaleTimeString() : '—';
+    const side = (f.side || '').toUpperCase();
+    return `
+      <div class="fill-row mono">
+        <span class="dim">${d}</span>
+        <span>${f.market || ''}</span>
+        <span class="side-${side.toLowerCase()}">${side}</span>
+        <span class="num">${(f.size ?? 0).toFixed(6)}</span>
+        <span class="num">@ ${(f.price ?? 0).toFixed(4)}</span>
+      </div>`;
+  }).join('');
+}
+
+// Subset of grid_params that can be live-edited. Must match
+// LIVE_CONFIG_KEYS in common/control_server.py — keys send a number-typed
+// value via POST /config and take effect on the next reconcile tick.
+const TUNABLES = [
+  ['order_size_usd',            'Order size ($)',            'any'],
+  ['levels_per_side',           'Levels per side ⚠',         '1'],
+  ['grid_step_bp',              'Grid step (bp)',             'any'],
+  ['max_notional_per_pair',     'Max notional / pair ($)',   'any'],
+  ['max_total_notional',        'Max total notional ($)',     'any'],
+  ['requote_drift_bp',          'Requote drift (bp)',         'any'],
+  ['requote_max_age_sec',       'Requote max age (s)',        'any'],
+  ['session_dd_limit_usd',      'Session DD limit ($)',       'any'],
+  ['pair_stop_loss_usd',        'Pair stop-loss ($)',         'any'],
+  ['fill_imbalance_ratio',      'Fill imbalance ratio',        'any'],
+  ['fill_imbalance_min_fills',  'Fill imbalance min fills',    '1'],
+];
+// ⚠ levels_per_side: changing this mid-session causes a brief (~2s)
+// cancel-replace burst across all pairs because the slot encoding
+// shifts. Reconciler self-heals, no positions affected.
+
+let tuneEditing = false;   // suppress overwriting an in-progress edit
+
+function renderTune(s) {
+  if (tuneEditing) return;            // don't clobber the user mid-edit
+  const g = s.grid || {};
+  const grid = $('tuneGrid');
+  grid.innerHTML = TUNABLES.map(([k, label, step]) => {
+    const cur = g[k];
+    const val = cur === undefined || cur === null ? '' : cur;
+    return `
+      <div class="tune-row">
+        <div class="tune-label">${label}</div>
+        <input type="number" step="${step}" name="${k}"
+               value="${val}" data-orig="${val}"
+               oninput="onTuneChange()">
+        <div class="tune-hint" data-key="${k}">unchanged</div>
+      </div>
+    `;
+  }).join('');
+  $('btnSaveTune').disabled = true;
+  $('btnRevertTune').disabled = true;
+  $('tuneChangedCount').textContent = '0 changes pending';
+}
+
+function onTuneChange() {
+  tuneEditing = true;
+  let changes = 0;
+  document.querySelectorAll('#tuneGrid input').forEach(inp => {
+    const orig = inp.dataset.orig;
+    const cur  = inp.value.trim();
+    const cell = document.querySelector(`#tuneGrid .tune-hint[data-key="${inp.name}"]`);
+    if (cur !== '' && cur !== orig) {
+      changes++;
+      if (cell) {
+        cell.textContent = `→ ${cur}`;
+        cell.classList.add('changed');
+      }
+    } else if (cell) {
+      cell.textContent = 'unchanged';
+      cell.classList.remove('changed');
+    }
+  });
+  $('btnSaveTune').disabled  = changes === 0;
+  $('btnRevertTune').disabled = changes === 0;
+  $('tuneChangedCount').textContent =
+    `${changes} change${changes === 1 ? '' : 's'} pending`;
+}
+
+async function saveTune() {
+  const payload = {};
+  document.querySelectorAll('#tuneGrid input').forEach(inp => {
+    const cur = inp.value.trim();
+    if (cur !== '' && cur !== inp.dataset.orig) {
+      payload[inp.name] = parseFloat(cur);
+    }
+  });
+  if (Object.keys(payload).length === 0) return;
+  try {
+    const r = await fetch(`${BASE}/config`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(payload),
+    });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const data = await r.json();
+    if (data.ok) {
+      $('tuneSavedMsg').textContent =
+        `saved ${Object.keys(data.updated).join(', ')} @ ${new Date().toLocaleTimeString()}`;
+      $('tuneSavedMsg').style.color = 'var(--ok)';
+    } else {
+      $('tuneSavedMsg').textContent =
+        `partial: ${JSON.stringify(data.errors)}`;
+      $('tuneSavedMsg').style.color = 'var(--warn)';
+    }
+    tuneEditing = false;
+    pollOnce();
+  } catch (e) {
+    $('tuneSavedMsg').textContent = `error: ${e.message}`;
+    $('tuneSavedMsg').style.color = 'var(--bad)';
+  }
+}
+
+function revertTune() {
+  tuneEditing = false;
+  if (lastStatus) renderTune(lastStatus);
+  $('tuneSavedMsg').textContent = '';
+}
+
+function renderConfig(s) {
+  const g = s.grid || {};
+  const order = [
+    ['pairs',                   'Pairs'],
+    ['trading',                 'Trading armed'],
+    ['expected_max_orders',     'Expected max orders'],
+  ];
+  $('configTbody').innerHTML = order
+    .filter(([k]) => g[k] !== undefined)
+    .map(([k, label]) => `
+      <tr>
+        <td class="dim" style="width:30%">${label}</td>
+        <td class="mono">${formatVal(g[k])}</td>
+      </tr>
+    `).join('');
+}
+
+function formatVal(v) {
+  if (typeof v === 'boolean') return v ? '<span class="pos-positive">true</span>'
+                                       : '<span class="dim">false</span>';
+  if (typeof v === 'number') {
+    if (v >= 1000 && Number.isInteger(v)) return v.toLocaleString();
+    return v;
+  }
+  if (Array.isArray(v)) return v.join(', ');
+  return String(v);
+}
+
+/* ────────────────────────────────────────────────────────────────── */
+/* controls */
+
+async function post(path, body) {
+  try {
+    const r = await fetch(`${BASE}${path}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: body ? JSON.stringify(body) : undefined,
+    });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    pollOnce();
+  } catch (err) {
+    alert(`Request failed: ${err.message}`);
+  }
+}
+
+$('btnStart').addEventListener('click', () => post('/start'));
+$('btnStop').addEventListener('click',  () => {
+  if (confirm('Pause the bot? Open positions and resting orders stay as-is.')) post('/stop');
+});
+$('btnSaveTune').addEventListener('click', saveTune);
+$('btnRevertTune').addEventListener('click', revertTune);
+$('btnCancel').addEventListener('click', () => {
+  if (confirm('Cancel ALL resting orders? Positions stay open.')) post('/close', { flatten: false });
+});
+$('btnClose').addEventListener('click',  () => {
+  if (confirm('CLOSE + FLATTEN ALL positions via market orders?\nIrreversible.')) post('/close', { flatten: true });
+});
+
+/* sort */
+document.querySelectorAll('thead th[data-sort]').forEach(th => {
+  th.style.cursor = 'pointer';
+  th.addEventListener('click', () => {
+    const k = th.dataset.sort;
+    if (sortKey === k) sortDir = sortDir === 'asc' ? 'desc' : 'asc';
+    else { sortKey = k; sortDir = 'asc'; }
+    if (lastStatus) renderPairs(lastStatus);
+  });
+});
+
+/* tick */
+pollOnce();
+pollTimer = setInterval(pollOnce, POLL_MS);
+
+</script>
+</body>
+</html>

@@ -1,0 +1,40 @@
+# ─── Secrets / credentials ─────────────────────────────────────────────────
+# NEVER commit a real .env. Only the .env.template files belong in git.
+accounts/*/.env
+accounts/*/.env.local
+.env
+.env.local
+
+# ─── Per-run data + logs (not source) ──────────────────────────────────────
+accounts/*/data/
+accounts/*/logs/
+*.log
+*.log.*
+
+# ─── Python build/runtime artefacts ────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ─── Virtualenvs ───────────────────────────────────────────────────────────
+venv/
+.venv/
+env/
+ENV/
+
+# ─── IDE / OS junk ─────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ─── Build / dist ──────────────────────────────────────────────────────────
+build/
+dist/
