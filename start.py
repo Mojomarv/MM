@@ -1,25 +1,26 @@
-"""One-command launcher for OndoPerpsMM.
+"""One-command launcher for the multi-venue MM bot.
 
 Starts:
-  1. The bot         (bots/mm/ondo_mm/multi_grid_bot.py, cwd=accounts/ondo1)
-  2. The dashboard   (dashboard/serve.py, cwd=project root)
-  3. The browser     (http://127.0.0.1:8141)
+  1. One or more bot processes (Ondo, Rise, or both) — each runs in its
+     own process group so this launcher can clean-shutdown via signal.
+  2. The dashboard (dashboard/serve.py, cwd=project root, default port 8141)
+  3. The browser (one tab per running bot)
 
-Both subprocesses run with their own process group so this launcher can
-send them a clean shutdown signal on Ctrl+C without the bot eating the
-same Ctrl+C from the parent console and skipping its cleanup.
+Output from every subprocess is prefixed and color-coded so you can read
+them side by side in one terminal:
 
-Output from both is prefixed and color-coded so you can read them side
-by side in one terminal:
-
-    [   bot    ] 2026-06-02 19:30:01,234 INFO config: pairs=...
+    [   ondo   ] 2026-06-02 19:30:01,234 INFO config: pairs=...
+    [   rise   ] 2026-06-02 19:30:01,567 INFO config: pairs=...
     [ dashboard ] Dashboard serving at http://127.0.0.1:8141
 
 Usage:
-    python start.py
-    python start.py --account ondo2          # use accounts/ondo2 instead
+    python start.py                          # default: ondo only
+    python start.py --venue rise             # rise only
+    python start.py --venue both             # both bots, one dashboard
+    python start.py --account ondo2          # override account subfolder
     python start.py --dashboard-port 9000    # override dashboard port
     python start.py --no-browser             # don't auto-open browser
+    python start.py --paused                 # boot bot(s) paused
     python start.py --flatten-on-stop        # market-close positions on shutdown
 
 Exit:
@@ -150,12 +151,66 @@ def _ensure_env(account_dir: Path) -> None:
     sys.exit(1)
 
 
+# Per-venue configuration: (default account dir, bot module path,
+# default control port, log-prefix color).
+VENUES = {
+    "ondo": {
+        "account":  "ondo1",
+        "bot_path": ROOT / "bots" / "mm" / "ondo_mm" / "multi_grid_bot.py",
+        "port":     8140,
+        "color":    CYAN,
+        "label":    "ondo",
+    },
+    "rise": {
+        "account":  "risex1",
+        "bot_path": ROOT / "bots" / "mm" / "risex_mm" / "multi_grid_bot.py",
+        "port":     8150,
+        "color":    "\033[33m",   # amber, distinct from ondo cyan
+        "label":    "rise",
+    },
+}
+
+
+def _launch_venue(venue: str, args, log) -> tuple[subprocess.Popen, str, int]:
+    """Launch one venue's bot subprocess. Returns (popen, dashboard URL, control_port)."""
+    cfg = VENUES[venue]
+    account = args.account or cfg["account"]
+    account_dir = ROOT / "accounts" / account
+    if not account_dir.is_dir():
+        log(f"account dir not found for venue={venue}: {account_dir}")
+        sys.exit(1)
+    _ensure_env(account_dir)
+
+    # Use the venue's default port unless --control-port overrides it.
+    port = args.control_port if args.control_port is not None else cfg["port"]
+
+    bot_env = {"CONTROL_PORT": str(port)}
+    if args.paused:
+        bot_env["START_PAUSED"] = "true"
+
+    log(f"{venue}: bot={cfg['bot_path'].name}  cwd={account_dir.name}  port={port}")
+    proc = _spawn(
+        [_resolve_python(), "-u", str(cfg["bot_path"])],
+        cwd=account_dir, label=cfg["label"], color=cfg["color"],
+        extra_env=bot_env,
+    )
+    url = (f"http://127.0.0.1:{args.dashboard_port}/?"
+           f"port={port}&v={int(time.time())}")
+    return proc, url, port
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Launch OndoPerps MM bot + dashboard.")
-    parser.add_argument("--account", default="ondo1",
-                          help="Subfolder under accounts/ (default: ondo1)")
-    parser.add_argument("--control-port", type=int, default=8140,
-                          help="Bot's control_server port (default 8140)")
+    parser = argparse.ArgumentParser(description="Launch the MM bot(s) + dashboard.")
+    parser.add_argument("--venue", default="ondo",
+                          choices=list(VENUES.keys()) + ["both"],
+                          help="Which venue to run (default: ondo). "
+                               "'both' launches Ondo + Rise on distinct ports.")
+    parser.add_argument("--account", default=None,
+                          help="Override the venue's default account subfolder. "
+                               "Only honoured for single-venue launches.")
+    parser.add_argument("--control-port", type=int, default=None,
+                          help="Override the venue's default control port. "
+                               "Only honoured for single-venue launches.")
     parser.add_argument("--dashboard-port", type=int, default=8141,
                           help="Dashboard static server port (default 8141)")
     parser.add_argument("--no-browser", action="store_true",
@@ -164,84 +219,82 @@ def main() -> None:
                           help="On Ctrl+C, POST /close?flatten=true before "
                                "terminating (market-closes all positions)")
     parser.add_argument("--paused", action="store_true",
-                          help="Boot the bot in paused state — WS feeds + "
-                               "dashboard come up but the quote loop won't "
-                               "place any orders until you click Start on "
-                               "the dashboard.")
+                          help="Boot bots in paused state. WS feeds + "
+                               "dashboard wire up but no orders are placed "
+                               "until you click Start.")
     args = parser.parse_args()
 
-    account_dir = ROOT / "accounts" / args.account
-    if not account_dir.is_dir():
-        print(f"{GREY}[  start   ]{RESET} account dir not found: {account_dir}",
-              flush=True)
-        sys.exit(1)
-    _ensure_env(account_dir)
-
-    python = _resolve_python()
-    bot_script  = ROOT / "bots" / "mm" / "ondo_mm" / "multi_grid_bot.py"
-    dash_script = ROOT / "dashboard" / "serve.py"
+    venues_to_launch = ["ondo", "rise"] if args.venue == "both" else [args.venue]
+    if args.venue == "both" and (args.account or args.control_port is not None):
+        print("note: --account and --control-port are ignored when --venue=both. "
+              "Override per-venue via accounts/<dir>/.env CONTROL_PORT instead.")
+        args.account = None
+        args.control_port = None
 
     def log(msg: str) -> None:
         print(f"{GREY}[  start   ]{RESET} {msg}", flush=True)
 
-    log(f"python      = {python}")
-    log(f"bot         = {bot_script}  (cwd={account_dir})")
-    log(f"dashboard   = {dash_script}  port={args.dashboard_port}")
-
-    bot_env = {}
+    log(f"python      = {_resolve_python()}")
+    log(f"venue       = {args.venue}  ({', '.join(venues_to_launch)})")
+    log(f"dashboard   = port {args.dashboard_port}")
     if args.paused:
-        bot_env["START_PAUSED"] = "true"
-        log("--paused: bot will boot idle; press Start on the dashboard to begin quoting")
+        log("--paused: bots will boot idle; press Start on the dashboard "
+            "to begin quoting")
 
-    bot = _spawn(
-        [python, "-u", str(bot_script)],
-        cwd=account_dir, label="bot", color=CYAN,
-        extra_env=bot_env,
-    )
+    # 1. Spawn each venue's bot
+    bots: list[tuple[str, subprocess.Popen, str, int]] = []
+    for venue in venues_to_launch:
+        proc, url, port = _launch_venue(venue, args, log)
+        bots.append((venue, proc, url, port))
+        time.sleep(0.3)   # stagger so startup banners don't interleave
 
-    # Tiny delay so the bot's banner lands first in the log.
+    # 2. Spawn the single dashboard server
     time.sleep(0.5)
-
     dash = _spawn(
-        [python, "-u", str(dash_script), str(args.dashboard_port)],
+        [_resolve_python(), "-u",
+         str(ROOT / "dashboard" / "serve.py"),
+         str(args.dashboard_port)],
         cwd=ROOT, label="dashboard", color=PINK,
     )
 
-    # Append a timestamp so the URL is unique per launch — bypasses any
-    # cached copy of index.html the browser may be holding from before
-    # we added the no-cache headers / Tune panel / etc.
-    url = (f"http://127.0.0.1:{args.dashboard_port}/?"
-           f"port={args.control_port}&v={int(time.time())}")
+    # 3. Open one browser tab per running bot
     if not args.no_browser:
-        # Give the http.server a moment to bind before opening the page.
         time.sleep(2.0)
-        try:
-            webbrowser.open(url)
-            log(f"opened {url}")
-        except Exception as exc:  # noqa: BLE001
-            log(f"open browser failed: {exc}")
+        for venue, _proc, url, _port in bots:
+            try:
+                webbrowser.open(url)
+                log(f"opened {venue}: {url}")
+            except Exception as exc:  # noqa: BLE001
+                log(f"open browser for {venue} failed: {exc}")
     else:
-        log(f"dashboard ready at {url}")
+        for venue, _proc, url, _port in bots:
+            log(f"{venue} dashboard ready at {url}")
 
-    # Watch both subprocesses; exit when either dies or Ctrl+C arrives.
+    # 4. Watch every subprocess; exit when any dies or Ctrl+C arrives.
     try:
         while True:
             time.sleep(1)
-            for name, p in (("bot", bot), ("dashboard", dash)):
+            for venue, p, _url, _port in bots:
                 if p.poll() is not None:
-                    log(f"{name} exited (code {p.returncode}) — shutting down")
+                    log(f"{venue} bot exited (code {p.returncode}) — shutting down")
                     raise KeyboardInterrupt
+            if dash.poll() is not None:
+                log(f"dashboard exited (code {dash.returncode}) — shutting down")
+                raise KeyboardInterrupt
     except KeyboardInterrupt:
-        print()  # newline after ^C
+        print()
         log("shutdown requested")
     finally:
-        # Optional graceful flatten via the bot's /close endpoint before
+        # Optional graceful flatten via each bot's /close endpoint before
         # we send the stop signal. Best-effort; we still terminate either way.
-        if args.flatten_on_stop and bot.poll() is None:
-            _request_close_flatten(args.control_port, log)
-            time.sleep(3.0)  # let the bot's close routine start
+        if args.flatten_on_stop:
+            for venue, p, _url, port in bots:
+                if p.poll() is None:
+                    _request_close_flatten(port, log)
+            time.sleep(3.0)
 
-        _shutdown(bot,  "bot")
+        for venue, p, _url, _port in bots:
+            _shutdown(p, f"{venue} bot")
         _shutdown(dash, "dashboard")
         log("done.")
 

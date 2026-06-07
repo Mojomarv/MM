@@ -1,3 +1,8 @@
 aiohttp>=3.9
 websockets>=12.0
 python-dotenv>=1.0
+
+# Used by the Rise bot only (bots/mm/risex_mm/rise_client.py) for the
+# EIP-712 signer + secp256k1 sign-in messages. Optional for the Ondo
+# bot — pip-installing it has no impact on Ondo's HMAC-only auth.
+eth-account>=0.11
