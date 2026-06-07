@@ -336,6 +336,11 @@ class RiseSigner:
             "signed with rise.trade for security."
         )
         signed = self._account.sign_message(encode_defunct(text=message))
+        # Rise's WS auth rejects a bare hex string ("invalid signature
+        # format: hex string without 0x prefix"). eth_account's
+        # bytes.hex() drops the 0x — add it back here and on every
+        # other signature site.
+        sig_hex = "0x" + signed.signature.hex()
         return {
             "method": "auth",
             "params": {
@@ -343,7 +348,7 @@ class RiseSigner:
                 "signer": self.signer_address,
                 "message": message,
                 "nonce": nonce,
-                "signature": signed.signature.hex(),
+                "signature": sig_hex,
             },
         }
 
@@ -358,7 +363,7 @@ class RiseSigner:
             "message": message,
         }
         signable = encode_typed_data(full_message=full)
-        return self._account.sign_message(signable).signature.hex()
+        return "0x" + self._account.sign_message(signable).signature.hex()
 
     def _witness_message(self, anchor: int, bitmap: int, deadline: int,
                            witness: dict) -> dict[str, Any]:

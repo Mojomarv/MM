@@ -278,28 +278,37 @@ async def consume_order_books(st: State, metas: dict[str, MarketMeta],
         bk = books[mid][side]
         for lv in levels:
             px = lv.get("price")
-            qty_str = lv.get("quantity", "0")
+            qty_str = lv.get("quantity") or lv.get("size") or "0"
             if px is None: continue
-            if qty_str == "0":
+            # Rise mainnet sends DECIMAL strings on the WS feeds
+            # ("61510.6", "1.234"), not wei-encoded integers as the
+            # docs originally suggested. Both deletion sentinels "0"
+            # and "0.0" should clear the level.
+            try:
+                qty_f = float(qty_str)
+            except (TypeError, ValueError):
+                continue
+            if qty_f <= 0:
                 bk.pop(px, None)
             else:
-                bk[px] = wei_to_float(qty_str)
+                bk[px] = qty_f
 
     def update_bbo(mid: int):
         sym = id_to_sym.get(mid)
         if sym is None: return
         bk = books[mid]
         if not bk["bids"] or not bk["asks"]: return
-        # Pick best bid (max price) / best ask (min price). Compare in
-        # numeric space — wei strings sort lexicographically only when
-        # equal length, which isn't guaranteed across rapidly-changing
-        # books.
-        best_bid_px_str = max(bk["bids"].keys(), key=lambda s: int(s))
-        best_ask_px_str = min(bk["asks"].keys(), key=lambda s: int(s))
-        b = st.pairs[sym].bbo
-        b.bid_px = wei_to_float(best_bid_px_str)
-        b.ask_px = wei_to_float(best_ask_px_str)
-        b.updated_ms = int(time.time() * 1000)
+        # Compare in float space (decimal strings can't be sorted
+        # lexicographically — "9.99" > "10.01" textually).
+        try:
+            best_bid_px_str = max(bk["bids"].keys(), key=lambda s: float(s))
+            best_ask_px_str = min(bk["asks"].keys(), key=lambda s: float(s))
+            b = st.pairs[sym].bbo
+            b.bid_px = float(best_bid_px_str)
+            b.ask_px = float(best_ask_px_str)
+            b.updated_ms = int(time.time() * 1000)
+        except (TypeError, ValueError):
+            return
 
     while not stop.is_set():
         try:
@@ -469,16 +478,27 @@ async def consume_positions(st: State, metas: dict[str, MarketMeta],
             if sym is None: continue
             ps = st.pairs.get(sym)
             if ps is None: continue
-            size_wei = p.get("size", "0")
-            side     = str(p.get("side") or "").upper()
-            avg_wei  = p.get("avg_entry_price", "0")
-            quote_wei = p.get("quote_amount", "0")
-            sz       = wei_to_float(size_wei)
-            sign     = -1.0 if side == "SELL" else 1.0 if side == "BUY" else 0.0
-            new_pos  = sign * sz
+            # Rise mainnet positions stream uses decimal strings, same
+            # as the orderbook feed — not wei. side can be a string
+            # (BUY/SELL) or integer enum (0=long, 1=short) depending on
+            # endpoint; handle both.
+            def _f(x) -> float:
+                try: return float(x)
+                except (TypeError, ValueError): return 0.0
+            sz_raw   = p.get("size", "0")
+            side_raw = p.get("side", "")
+            avg_raw  = p.get("avg_entry_price", "0")
+            quote_raw = p.get("quote_amount", "0")
+            sz = _f(sz_raw)
+            if isinstance(side_raw, int):
+                sign = 1.0 if side_raw == 0 else -1.0
+            else:
+                s = str(side_raw).upper()
+                sign = -1.0 if s == "SELL" else 1.0 if s == "BUY" else 0.0
+            new_pos = sign * sz
             ps.position    = new_pos
-            ps.avg_entry   = wei_to_float(avg_wei)
-            ps.position_value = wei_to_float(quote_wei)
+            ps.avg_entry   = _f(avg_raw)
+            ps.position_value = _f(quote_raw)
             # Recompute unrealized from live mid when we have both.
             if ps.bbo.mid is not None and new_pos != 0 and ps.avg_entry > 0:
                 ps.unrealized_pnl = new_pos * (ps.bbo.mid - ps.avg_entry)
@@ -860,12 +880,34 @@ async def cancel_one(rest: RiseRest, meta: MarketMeta, coid: int,
 
 async def cancel_all_orders_safe(rest: RiseRest, metas: dict[str, MarketMeta],
                                    log: logging.Logger) -> None:
-    """Per-market cancel-all (Rise cancel-all is per-market, not global)."""
+    """Per-market cancel-all (Rise cancel-all is per-market, not global).
+
+    Rise's cancel-all endpoint may reject server-signing permits with
+    'signature is required' — server-mode appears to only work for
+    place_order. Per-market cancellation of individual orders during
+    the normal reconcile loop still works because we cancel by orderId
+    via the place_order signer path (or fall back to leaving orphans
+    for the REST sweep). So this startup mass-cancel is best-effort:
+    log once at INFO if it's the known server-mode error, never WARN.
+    """
+    known_server_mode = "signature is required"
+    first_signature_warned = False
     for sym, meta in metas.items():
         try:
             await rest.cancel_all_orders(meta.market_id)
         except RiseRestError as exc:
-            log.warning(f"cancel_all {sym}: {exc}")
+            msg = str(exc)
+            if known_server_mode in msg:
+                if not first_signature_warned:
+                    log.info(
+                        "cancel_all: skipping mass-cancel — "
+                        "Rise rejected server-mode permit "
+                        "(needs client-side EIP-712). Bot proceeds normally; "
+                        "individual cancels during reconcile still work."
+                    )
+                    first_signature_warned = True
+            else:
+                log.warning(f"cancel_all {sym}: {exc}")
         except Exception as exc:  # noqa: BLE001
             log.warning(f"cancel_all {sym}: {type(exc).__name__}: {exc}")
 
