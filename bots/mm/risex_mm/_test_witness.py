@@ -221,6 +221,39 @@ def variants() -> list[tuple[str, dict, str, dict]]:
     msg = {**envelope_message(True), **order_message()}
     out.append(("V12: alphabetical field order", types, "VerifyWitness", msg))
 
+    # ── TradeOrder primary type variants (per other devs' reports that
+    # the docs originally described `TradeOrder` not `VerifyWitness`) ─
+    for dl_t, nc_t in [("uint40", "uint48"), ("uint48", "uint48"),
+                        ("uint256", "uint256")]:
+        for acc in [True, False]:
+            types = {"EIP712Domain": EIP712_DOMAIN_TYPE,
+                     "TradeOrder": envelope_fields(dl_t, nc_t, acc) +
+                                    order_fields_types()}
+            msg = ({**envelope_message(acc), **order_message()})
+            out.append((f"V_TO: TradeOrder {dl_t}/{nc_t} account={acc}",
+                         types, "TradeOrder", msg))
+
+    # Nested Order witness under TradeOrder
+    types = {"EIP712Domain": EIP712_DOMAIN_TYPE,
+             "TradeOrder": envelope_fields("uint40", "uint48", True) + [
+                 {"name": "witness", "type": "Order"}],
+             "Order": order_fields_types()}
+    out.append(("V_TO: TradeOrder nested Order, uint40/uint48, account",
+                 types, "TradeOrder",
+                 {**envelope_message(True), "witness": order_message()}))
+
+    # Plain TradeOrder without permit envelope (just order fields)
+    types = {"EIP712Domain": EIP712_DOMAIN_TYPE,
+             "TradeOrder": [{"name": "account", "type": "address"}] + order_fields_types()}
+    out.append(("V_TO: TradeOrder bare (account + order only)",
+                 types, "TradeOrder",
+                 {"account": PERMIT_ENVELOPE["account"], **order_message()}))
+
+    types = {"EIP712Domain": EIP712_DOMAIN_TYPE,
+             "TradeOrder": order_fields_types()}
+    out.append(("V_TO: TradeOrder bare (order only, no account)",
+                 types, "TradeOrder", order_message()))
+
     return out
 
 
