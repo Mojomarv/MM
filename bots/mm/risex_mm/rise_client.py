@@ -528,14 +528,24 @@ class RiseRestError(Exception):
 
 class RiseRest:
     """Thin async REST client for Rise. One aiohttp session shared across
-    all calls; caller owns the lifecycle via close()."""
+    all calls; caller owns the lifecycle via close().
+
+    Optional X-Auth-Token header (browser-grabbed session token) unlocks
+    every endpoint EXCEPT /v1/orders/place — that one still requires a
+    signed permit. Useful for monitoring + cancels even without the
+    permit schema."""
 
     def __init__(self, base_url: str, signer: RiseSigner,
-                 timeout_sec: float = 10.0):
+                 timeout_sec: float = 10.0,
+                 session_token: str | None = None):
         self.base_url = base_url.rstrip("/")
         self.signer   = signer
+        self.session_token = session_token
         self._session: aiohttp.ClientSession | None = None
         self._timeout = aiohttp.ClientTimeout(total=timeout_sec)
+
+    def _auth_headers(self) -> dict[str, str]:
+        return {"X-Auth-Token": self.session_token} if self.session_token else {}
 
     async def _sess(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -548,7 +558,8 @@ class RiseRest:
 
     async def _post(self, path: str, body: dict) -> dict:
         sess = await self._sess()
-        async with sess.post(f"{self.base_url}{path}", json=body) as r:
+        async with sess.post(f"{self.base_url}{path}", json=body,
+                              headers=self._auth_headers()) as r:
             text = await r.text()
             try:
                 data = json.loads(text) if text else {}
@@ -561,7 +572,8 @@ class RiseRest:
 
     async def _get(self, path: str, params: dict | None = None) -> dict:
         sess = await self._sess()
-        async with sess.get(f"{self.base_url}{path}", params=params or {}) as r:
+        async with sess.get(f"{self.base_url}{path}", params=params or {},
+                              headers=self._auth_headers()) as r:
             text = await r.text()
             try:
                 data = json.loads(text) if text else {}
