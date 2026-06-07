@@ -59,6 +59,11 @@ import aiohttp
 import websockets
 from eth_account import Account
 from eth_account.messages import encode_defunct, encode_typed_data
+# Account.to_checksum_address was removed from eth_account in newer
+# releases — the helper moved into eth_utils, which is a transitive
+# dependency. Import from the new home so the signer works regardless
+# of which eth_account version is installed.
+from eth_utils import to_checksum_address
 
 
 # Permit mode: "server" sends signer_private_key in the permit (Rise's
@@ -276,8 +281,8 @@ class RiseSigner:
     def __init__(self, account_address: str, signer_address: str,
                  signer_private_key: str, domain: EIP712Domain,
                  permit_mode: str = PERMIT_MODE):
-        self.account_address = Account.to_checksum_address(account_address)
-        self.signer_address  = Account.to_checksum_address(signer_address)
+        self.account_address = to_checksum_address(account_address)
+        self.signer_address  = to_checksum_address(signer_address)
         self._account = Account.from_key(signer_private_key)
         if self._account.address.lower() != self.signer_address.lower():
             raise ValueError(

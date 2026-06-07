@@ -270,14 +270,22 @@ def main() -> None:
         for venue, _proc, url, _port in bots:
             log(f"{venue} dashboard ready at {url}")
 
-    # 4. Watch every subprocess; exit when any dies or Ctrl+C arrives.
+    # 4. Watch every subprocess. A single bot dying (e.g. config error)
+    # no longer kills the others — we only shut down when EVERY bot is
+    # gone, or the dashboard dies, or the user hits Ctrl+C.
+    bot_exit_logged: set[int] = set()
     try:
         while True:
             time.sleep(1)
             for venue, p, _url, _port in bots:
-                if p.poll() is not None:
-                    log(f"{venue} bot exited (code {p.returncode}) — shutting down")
-                    raise KeyboardInterrupt
+                if p.poll() is not None and id(p) not in bot_exit_logged:
+                    log(f"{venue} bot exited (code {p.returncode}) — "
+                        f"others continue. Re-run `python start.py "
+                        f"--venue {venue}` after fixing to bring it back.")
+                    bot_exit_logged.add(id(p))
+            if all(p.poll() is not None for _v, p, _u, _po in bots):
+                log("all bots have exited — shutting down")
+                raise KeyboardInterrupt
             if dash.poll() is not None:
                 log(f"dashboard exited (code {dash.returncode}) — shutting down")
                 raise KeyboardInterrupt
