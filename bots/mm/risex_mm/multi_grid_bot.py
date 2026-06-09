@@ -647,7 +647,7 @@ async def orphan_cleanup_loop(st: State, rest: RiseRest | None,
             )
             await _throttle_signed_op(st)
             try:
-                await rest.cancel_order(market_id, oid)
+                await rest.cancel_order(market_id=market_id, order_id=oid)
             except RiseRestError as exc:
                 if exc.is_rate_limited:
                     _on_rate_limit(st, log, f"orphan cancel {meta.symbol}")
@@ -817,9 +817,9 @@ async def place_order(rest: RiseRest | None, meta: MarketMeta,
                        log: logging.Logger) -> tuple[bool, str, str]:
     """Submit a POST_ONLY limit order. Returns (ok, info, order_id).
 
-    On success the WS will confirm with status=OPEN and populate
-    st.coid_to_oid. The composite order_id from the REST response is
-    also returned for callers that want to track it immediately.
+    Hash is computed over (size_steps, price_ticks) per risex-client's
+    encodeOrder. client_order_id is passed through so the contract can
+    bind the signature to it (also enables V3_FLAG_CLIENT_ID).
     """
     if rest is None:
         return True, "dry_run", ""
@@ -829,11 +829,12 @@ async def place_order(rest: RiseRest | None, meta: MarketMeta,
             side=0 if is_buy else 1,
             size_steps=size_steps,
             price_ticks=price_ticks,
-            client_order_id=coid,
             post_only=True,
             order_type=1,        # Limit
             time_in_force=0,     # GTC
             stp_mode=0,          # ExpireMaker
+            ttl_units=0,
+            client_order_id=coid,
         )
     except RiseRestError as exc:
         if exc.is_rate_limited:
@@ -842,7 +843,9 @@ async def place_order(rest: RiseRest | None, meta: MarketMeta,
     except Exception as exc:  # noqa: BLE001
         return False, f"{type(exc).__name__}: {exc}", ""
     _on_signed_ok(st, log)
-    return True, "placed", result.get("order_id", "")
+    # Response shape: {"data": {"order_id": "0x...", ...}}
+    data = result.get("data") or result
+    return True, "placed", data.get("order_id", "")
 
 
 async def cancel_one(rest: RiseRest, meta: MarketMeta, coid: int,
@@ -863,7 +866,7 @@ async def cancel_one(rest: RiseRest, meta: MarketMeta, coid: int,
         return False
     await _throttle_signed_op(st)
     try:
-        await rest.cancel_order(meta.market_id, oid)
+        await rest.cancel_order(market_id=meta.market_id, order_id=oid)
     except RiseRestError as exc:
         if exc.is_rate_limited:
             _on_rate_limit(st, log, f"cancel {meta.symbol}")
@@ -1313,7 +1316,7 @@ async def close_all_positions(st: State, rest: RiseRest,
         size_steps = _to_steps(abs(ps.position), meta.step_size)
         if size_steps <= 0: continue
         is_buy = ps.position < 0   # short -> buy to close, long -> sell to close
-        # Market order: order_type=0, IOC, reduce_only=True.
+        # Market order: order_type=0 (Rise enum: 0=Market), IOC, reduce_only=True.
         log.info(f"close {sym}: pos={ps.position:+g} -> "
                  f"{'BUY' if is_buy else 'SELL'} {size_steps} steps (reduce_only)")
         await _throttle_signed_op(st)
@@ -1322,13 +1325,14 @@ async def close_all_positions(st: State, rest: RiseRest,
                 market_id=meta.market_id,
                 side=0 if is_buy else 1,
                 size_steps=size_steps,
-                price_ticks=1,         # ignored for market orders
-                client_order_id=_make_coid(st, 0, 0),
+                price_ticks=0,         # ignored for market orders
                 post_only=False,
                 reduce_only=True,
                 order_type=0,          # Market
                 time_in_force=3,       # IOC
                 stp_mode=0,
+                ttl_units=0,
+                client_order_id=_make_coid(st, 0, 0),
             )
         except RiseRestError as exc:
             log.error(f"close {sym} failed: {exc}")
@@ -1405,6 +1409,8 @@ async def main():
         signer.domain = domain
         log.info(f"EIP-712 domain: name={domain.name} chain={domain.chain_id} "
                  f"contract={domain.verifying_contract}")
+        target = await rest.fetch_and_set_target()
+        log.info(f"orders_manager target: {target}")
 
         markets_resp = await rest.get_markets()
         metas = parse_markets_response(markets_resp, set(symbols))

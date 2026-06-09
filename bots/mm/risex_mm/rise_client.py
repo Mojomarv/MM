@@ -64,7 +64,7 @@ from eth_account.messages import encode_defunct, encode_typed_data
 # releases — the helper moved into eth_utils, which is a transitive
 # dependency. Import from the new home so the signer works regardless
 # of which eth_account version is installed.
-from eth_utils import to_checksum_address
+from eth_utils import to_checksum_address, keccak as eth_keccak
 
 
 # Permit mode: "server" sends signer_private_key in the permit (Rise's
@@ -163,29 +163,23 @@ def float_to_wei(x: float) -> int:
     return int(Decimal(str(x)) * WEI)
 
 
-# ---- EIP-712 signing -----------------------------------------------------
+# ---- EIP-712 signing (port of risex-client TS SDK) ----------------------
+#
+# Reference: https://github.com/SmoothBot/risex-ts (MIT)
+# Files mirrored: src/signing/{domain,encoder,permit,signer}.ts
+#
+# Signing has two layers:
+#   1) Action-data hash: keccak256(abi.encode(actionTypeHash, ...packed
+#      order data...)). Each action type (PLACE, CANCEL, CANCEL_ALL) has
+#      its own constant string typehash and abi.encode layout.
+#   2) EIP-712 typed-data over a VerifyWitness struct that bundles the
+#      account + target contract + the bytes32 action hash + Permit2-style
+#      nonce_anchor / nonce_bitmap_index + deadline.
+#
+# The signature is a 65-byte (r||s||v) hex string, base64-encoded — NOT
+# EIP-2098 compact.
 
-# === PLACEHOLDER — these need exact schemas from Rise ===
-#
-# The Rise public docs describe permits as Permit2-style "VerifyWitness"
-# payloads but never spell out the type strings. The shapes below are
-# educated guesses based on the wire fields in the REST docs; signatures
-# generated with them will FAIL verification on Rise's verifying contract
-# until the real types are dropped in.
-#
-# Where to find the real definitions:
-#   1) DevTools -> Sources on app.rise.trade — grep for 'EIP712Domain'
-#      and 'PermitSingle' in the JS bundle.
-#   2) The verifying contract source on the RISE Chain explorer (verified
-#      bytecode), if open.
-#   3) dev@rise.trade — request type definitions for Order, Cancel,
-#      CancelAll permits.
-#
-# Replace _ORDER_PERMIT_TYPES / _CANCEL_PERMIT_TYPES / _CANCEL_ALL_PERMIT_TYPES
-# with the actual schemas; nothing else needs to change.
-
-# Each entry is the EIP-712 `types` dict. The primary type the signer hashes
-# is the FIRST key after EIP712Domain.
+from eth_abi import encode as abi_encode  # noqa: E402
 
 _EIP712_DOMAIN_TYPE = [
     {"name": "name", "type": "string"},
@@ -194,70 +188,138 @@ _EIP712_DOMAIN_TYPE = [
     {"name": "verifyingContract", "type": "address"},
 ]
 
-# EIP-712 types derived from the captured rise.trade frontend payload.
-# Wire-format permit envelope fields: account, signer, nonce_anchor,
-# nonce_bitmap_index, deadline, signature (signature is 64-byte EIP-2098
-# compact, base64-encoded — not hex like our placeholder code assumed).
-#
-# nonce_anchor is uint48 (small sequential, fetched from
-# GET /v1/nonce-state/{account}), nonce_bitmap_index is uint8 (0-207),
-# deadline is uint40 unix seconds.
-#
-# The order fields are INLINED into VerifyWitness (no nested Order
-# struct) — the captured permit had no `witness` field, so the server
-# reconstructs the hash directly from the order data sent in the parent
-# request body.
-_ORDER_PERMIT_TYPES = {
-    "EIP712Domain": _EIP712_DOMAIN_TYPE,
-    "VerifyWitness": [
-        {"name": "account",            "type": "address"},
-        {"name": "signer",             "type": "address"},
-        {"name": "nonce_anchor",       "type": "uint48"},
-        {"name": "nonce_bitmap_index", "type": "uint8"},
-        {"name": "deadline",           "type": "uint40"},
-        # Order witness inlined:
-        {"name": "market_id",          "type": "uint16"},
-        {"name": "side",               "type": "uint8"},
-        {"name": "size_steps",         "type": "uint32"},
-        {"name": "price_ticks",        "type": "uint24"},
-        {"name": "post_only",          "type": "bool"},
-        {"name": "reduce_only",        "type": "bool"},
-        {"name": "stp_mode",           "type": "uint8"},
-        {"name": "order_type",         "type": "uint8"},
-        {"name": "time_in_force",      "type": "uint8"},
-        {"name": "client_order_id",    "type": "uint64"},
-        {"name": "ttl_units",          "type": "uint16"},
-        {"name": "builder_id",         "type": "uint16"},
-    ],
-}
-_ORDER_PERMIT_PRIMARY = "VerifyWitness"
+# ─── Action typehashes ─────────────────────────────────────────────
+ACTION_PLACE_ORDER       = b"RISE_PERPS_PLACE_ORDER_V1"
+ACTION_CANCEL_ORDER      = b"RISE_PERPS_CANCEL_ORDER_V1"
+ACTION_CANCEL_ALL_ORDERS = b"RISE_PERPS_CANCEL_ALL_ORDERS_V1"
 
-_CANCEL_PERMIT_TYPES = {
-    "EIP712Domain": _EIP712_DOMAIN_TYPE,
-    "VerifyWitness": [
-        {"name": "account",            "type": "address"},
-        {"name": "signer",             "type": "address"},
-        {"name": "nonce_anchor",       "type": "uint48"},
-        {"name": "nonce_bitmap_index", "type": "uint8"},
-        {"name": "deadline",           "type": "uint40"},
-        {"name": "market_id",          "type": "uint16"},
-        {"name": "order_id",           "type": "bytes"},
-    ],
-}
-_CANCEL_PERMIT_PRIMARY = "VerifyWitness"
+_ACTION_PLACE_ORDER_HASH       = eth_keccak(ACTION_PLACE_ORDER)
+_ACTION_CANCEL_ORDER_HASH      = eth_keccak(ACTION_CANCEL_ORDER)
+_ACTION_CANCEL_ALL_ORDERS_HASH = eth_keccak(ACTION_CANCEL_ALL_ORDERS)
 
-_CANCEL_ALL_PERMIT_TYPES = {
+# ─── Protocol header flags (computed by computeHeaderFlags) ─────────
+V3_FLAG_PERMIT         = 0x01
+V3_FLAG_BUILDER        = 0x02
+V3_FLAG_CLIENT_ID      = 0x04
+V3_FLAG_PERMIT_ERC1271 = 0x09
+V3_FLAG_TTL            = 0x10
+
+
+def _compute_header_flags(*, builder_id: int, client_order_id: int,
+                            ttl_units: int, is_erc1271: bool = False) -> int:
+    """Set V3 protocol header bits based on which optional fields are present."""
+    flags = V3_FLAG_PERMIT_ERC1271 if is_erc1271 else V3_FLAG_PERMIT
+    if builder_id      != 0: flags |= V3_FLAG_BUILDER
+    if client_order_id != 0: flags |= V3_FLAG_CLIENT_ID
+    if ttl_units       != 0: flags |= V3_FLAG_TTL
+    return flags
+
+
+def _encode_order_data(*, market_id: int, size_steps: int, price_ticks: int,
+                         side: int, post_only: bool, reduce_only: bool,
+                         stp_mode: int, order_type: int,
+                         time_in_force: int) -> int:
+    """Compress order fields into a single 88-bit big-endian uint.
+
+    Bit layout (matching risex-ts encodeOrderData):
+      [87:70] marketId      (16 bits)
+      [69:38] sizeSteps     (32 bits)
+      [37:14] priceTicks    (24 bits)
+      [13:6]  orderFlags    (8 bits)
+      [5:1]   headerVersion (5 bits, always 1)
+      [0]     reserved      (1 bit, 0)
+
+    orderFlags byte:
+      bit 0: side          (0=long, 1=short)
+      bit 1: postOnly
+      bit 2: reduceOnly
+      bit 3-4: stpMode     (uint2)
+      bit 5: orderType     (0=Market, 1=Limit)
+      bit 6-7: timeInForce (uint2: 0=GTC, 1=IOC?, etc.)
+    """
+    order_flags = 0
+    if side & 1:    order_flags |= 0x01
+    if post_only:   order_flags |= 0x02
+    if reduce_only: order_flags |= 0x04
+    order_flags |= (stp_mode      & 0x03) << 3
+    order_flags |= (order_type    & 0x01) << 5
+    order_flags |= (time_in_force & 0x03) << 6
+
+    header_version = 1
+    data = 0
+    data |= (market_id    & 0xFFFF)     << 70
+    data |= (size_steps   & 0xFFFFFFFF) << 38
+    data |= (price_ticks  & 0xFFFFFF)   << 14
+    data |= (order_flags  & 0xFF)       << 6
+    data |= (header_version & 0x1F)     << 1
+    return data
+
+
+def encode_place_order_hash(*, market_id: int, size_steps: int,
+                              price_ticks: int, side: int, post_only: bool,
+                              reduce_only: bool, stp_mode: int, order_type: int,
+                              time_in_force: int, ttl_units: int = 0,
+                              builder_id: int = 0, client_order_id: int = 0,
+                              is_erc1271: bool = False) -> bytes:
+    """Compute the bytes32 action hash that gets embedded in VerifyWitness.
+
+    hash = keccak256(abi.encode(
+        actionTypeHash,            // bytes32
+        headerFlags,               // uint8
+        orderData,                 // uint256 (88-bit packed)
+        builderId,                 // uint16
+        clientOrderId,             // uint64
+        ttlUnits                   // uint16
+    ))
+    """
+    order_data = _encode_order_data(
+        market_id=market_id, size_steps=size_steps, price_ticks=price_ticks,
+        side=side, post_only=post_only, reduce_only=reduce_only,
+        stp_mode=stp_mode, order_type=order_type, time_in_force=time_in_force,
+    )
+    header_flags = _compute_header_flags(
+        builder_id=builder_id, client_order_id=client_order_id,
+        ttl_units=ttl_units, is_erc1271=is_erc1271,
+    )
+    encoded = abi_encode(
+        ["bytes32", "uint8", "uint256", "uint16", "uint64", "uint16"],
+        [_ACTION_PLACE_ORDER_HASH, header_flags, order_data,
+         int(builder_id), int(client_order_id), int(ttl_units)],
+    )
+    return eth_keccak(encoded)
+
+
+def encode_cancel_order_hash(*, market_id: int, resting_order_id: int) -> bytes:
+    """keccak256(abi.encode(actionTypeHash, uint256(marketId), uint256(restingOrderId)))"""
+    encoded = abi_encode(
+        ["bytes32", "uint256", "uint256"],
+        [_ACTION_CANCEL_ORDER_HASH, int(market_id), int(resting_order_id)],
+    )
+    return eth_keccak(encoded)
+
+
+def encode_cancel_all_hash(*, market_id: int) -> bytes:
+    """keccak256(abi.encode(actionTypeHash, uint256(marketId)))"""
+    encoded = abi_encode(
+        ["bytes32", "uint256"],
+        [_ACTION_CANCEL_ALL_ORDERS_HASH, int(market_id)],
+    )
+    return eth_keccak(encoded)
+
+
+# ─── VerifyWitness EIP-712 typed-data ───────────────────────────────
+_VERIFY_WITNESS_TYPES = {
     "EIP712Domain": _EIP712_DOMAIN_TYPE,
     "VerifyWitness": [
-        {"name": "account",            "type": "address"},
-        {"name": "signer",             "type": "address"},
-        {"name": "nonce_anchor",       "type": "uint48"},
-        {"name": "nonce_bitmap_index", "type": "uint8"},
-        {"name": "deadline",           "type": "uint40"},
-        {"name": "market_id",          "type": "uint16"},
+        {"name": "account",     "type": "address"},
+        {"name": "target",      "type": "address"},   # router/orders_manager
+        {"name": "hash",        "type": "bytes32"},
+        {"name": "nonceAnchor", "type": "uint48"},
+        {"name": "nonceBitmap", "type": "uint8"},
+        {"name": "deadline",    "type": "uint32"},
     ],
 }
-_CANCEL_ALL_PERMIT_PRIMARY = "VerifyWitness"
+_MAX_BITMAP_INDEX = 207
 
 
 # WS-login typed-data — confirmed from the official Rise docs (the
@@ -313,7 +375,8 @@ class RiseSigner:
 
     def __init__(self, account_address: str, signer_address: str,
                  signer_private_key: str, domain: EIP712Domain,
-                 permit_mode: str = PERMIT_MODE):
+                 permit_mode: str = PERMIT_MODE,
+                 target_address: str | None = None):
         self.account_address = to_checksum_address(account_address)
         self.signer_address  = to_checksum_address(signer_address)
         self._account = Account.from_key(signer_private_key)
@@ -329,9 +392,19 @@ class RiseSigner:
             k = "0x" + k
         self._signer_private_key_hex = k.lower()
         self.domain = domain
+        # `target` is the router / orders_manager contract address that
+        # the VerifyWitness permit authorizes calls to. Fetched from
+        # /v1/system-config and set via set_target(); permits cannot be
+        # signed before it's known.
+        self.target_address: str | None = (
+            to_checksum_address(target_address) if target_address else None
+        )
         if permit_mode not in ("server", "client"):
             raise ValueError(f"permit_mode must be 'server' or 'client', got {permit_mode!r}")
         self.permit_mode = permit_mode
+
+    def set_target(self, target: str) -> None:
+        self.target_address = to_checksum_address(target)
 
     def _base_permit(self) -> dict[str, Any]:
         """Return the common permit envelope fields. Caller adds either
@@ -424,89 +497,121 @@ class RiseSigner:
         compact = r_bytes + yps_bytes
         return base64.b64encode(compact).decode("ascii")
 
-    def _envelope(self, nonce_anchor: int, nonce_bitmap_index: int,
-                    deadline: int) -> dict[str, Any]:
-        """Build the wire-format permit envelope (no signature yet).
-        Matches the captured rise.trade frontend payload field set:
-        account, signer, nonce_anchor (str), nonce_bitmap_index, deadline."""
+    def _sign_witness_b64(self, action_hash: bytes, *, nonce_anchor: int,
+                            nonce_bitmap_index: int, deadline: int) -> str:
+        """Sign the VerifyWitness typed-data over an action hash and
+        return a base64-encoded 65-byte (r||s||v) signature."""
+        if self.target_address is None:
+            raise RuntimeError(
+                "RiseSigner.target_address not set — call set_target() "
+                "with the router/orders_manager address from /v1/system-config "
+                "before signing any permit."
+            )
+        msg = {
+            "account":     self.account_address,
+            "target":      self.target_address,
+            "hash":        action_hash,
+            "nonceAnchor": int(nonce_anchor),
+            "nonceBitmap": int(nonce_bitmap_index),
+            "deadline":    int(deadline),
+        }
+        full = {
+            "types":        _VERIFY_WITNESS_TYPES,
+            "domain":       self.domain.as_dict(),
+            "primaryType":  "VerifyWitness",
+            "message":      msg,
+        }
+        signable = encode_typed_data(full_message=full)
+        signed   = self._account.sign_message(signable)
+        # 65-byte r||s||v (with v fixed up to 27/28 if needed).
+        v = signed.v if signed.v >= 27 else signed.v + 27
+        raw = signed.r.to_bytes(32, "big") + signed.s.to_bytes(32, "big") + bytes([v])
+        return base64.b64encode(raw).decode("ascii")
+
+    def _v3_permit(self, *, nonce_anchor: int, nonce_bitmap_index: int,
+                     deadline: int, signature_b64: str) -> dict[str, Any]:
+        """V3 permit envelope sent on the wire body's `permit` field.
+        Note: nonce_anchor sent as int per the TS SDK (not str)."""
         return {
             "account":            self.account_address,
             "signer":             self.signer_address,
-            "nonce_anchor":       str(nonce_anchor),
+            "nonce_anchor":       int(nonce_anchor),
             "nonce_bitmap_index": int(nonce_bitmap_index),
             "deadline":           int(deadline),
+            "signature":          signature_b64,
         }
 
-    def sign_order_permit(self, order_fields: dict[str, Any],
+    @staticmethod
+    def adjust_nonce_for_bitmap_rollover(nonce_anchor: int, bitmap_index: int,
+                                          ) -> tuple[int, int]:
+        """If the bitmap is exhausted, advance the anchor and reset the index.
+        Mirrors createPermitParams in the TS SDK."""
+        if bitmap_index > _MAX_BITMAP_INDEX:
+            return nonce_anchor + 1, 0
+        return nonce_anchor, bitmap_index
+
+    def sign_order_permit(self, *, market_id: int, size_steps: int,
+                            price_ticks: int, side: int, post_only: bool,
+                            reduce_only: bool, stp_mode: int, order_type: int,
+                            time_in_force: int, ttl_units: int,
+                            builder_id: int, client_order_id: int,
                             nonce_anchor: int, nonce_bitmap_index: int,
-                            deadline_secs: int = 3600) -> dict[str, Any]:
-        """Build the order-placement permit. Always client-side EIP-712
-        signed now (Rise's server-signing mode doesn't work for orders).
-        nonce_anchor and nonce_bitmap_index are fetched from
-        GET /v1/nonce-state/{account} before each call."""
+                            deadline_secs: int = 7 * 24 * 3600,
+                          ) -> dict[str, Any]:
         deadline = self.deadline_in(deadline_secs)
-        permit = self._envelope(nonce_anchor, nonce_bitmap_index, deadline)
-        msg = {
-            "account":            self.account_address,
-            "signer":             self.signer_address,
-            "nonce_anchor":       int(nonce_anchor),
-            "nonce_bitmap_index": int(nonce_bitmap_index),
-            "deadline":           int(deadline),
-            "market_id":          int(order_fields["market_id"]),
-            "side":               int(order_fields["side"]),
-            "size_steps":         int(order_fields["size_steps"]),
-            "price_ticks":        int(order_fields["price_ticks"]),
-            "post_only":          bool(order_fields.get("post_only", True)),
-            "reduce_only":        bool(order_fields.get("reduce_only", False)),
-            "stp_mode":           int(order_fields.get("stp_mode", 0)),
-            "order_type":         int(order_fields.get("order_type", 1)),
-            "time_in_force":      int(order_fields.get("time_in_force", 0)),
-            "client_order_id":    int(order_fields.get("client_order_id", 0)),
-            "ttl_units":          int(order_fields.get("ttl_units", 0)),
-            "builder_id":         int(order_fields.get("builder_id", 0)),
-        }
-        permit["signature"] = self._sign_typed_b64_compact(
-            _ORDER_PERMIT_TYPES, _ORDER_PERMIT_PRIMARY, msg,
+        anchor, bitmap = self.adjust_nonce_for_bitmap_rollover(
+            int(nonce_anchor), int(nonce_bitmap_index),
         )
-        return permit
+        h = encode_place_order_hash(
+            market_id=market_id, size_steps=size_steps, price_ticks=price_ticks,
+            side=side, post_only=post_only, reduce_only=reduce_only,
+            stp_mode=stp_mode, order_type=order_type,
+            time_in_force=time_in_force, ttl_units=ttl_units,
+            builder_id=builder_id, client_order_id=client_order_id,
+        )
+        sig_b64 = self._sign_witness_b64(
+            h, nonce_anchor=anchor, nonce_bitmap_index=bitmap, deadline=deadline,
+        )
+        return self._v3_permit(
+            nonce_anchor=anchor, nonce_bitmap_index=bitmap,
+            deadline=deadline, signature_b64=sig_b64,
+        )
 
-    def sign_cancel_permit(self, market_id: int, order_id: str,
+    def sign_cancel_permit(self, *, market_id: int, resting_order_id: int,
                              nonce_anchor: int, nonce_bitmap_index: int,
-                             deadline_secs: int = 3600) -> dict[str, Any]:
+                             deadline_secs: int = 7 * 24 * 3600,
+                           ) -> dict[str, Any]:
         deadline = self.deadline_in(deadline_secs)
-        permit = self._envelope(nonce_anchor, nonce_bitmap_index, deadline)
-        oid_hex = order_id[2:] if order_id.startswith("0x") else order_id
-        msg = {
-            "account":            self.account_address,
-            "signer":             self.signer_address,
-            "nonce_anchor":       int(nonce_anchor),
-            "nonce_bitmap_index": int(nonce_bitmap_index),
-            "deadline":           int(deadline),
-            "market_id":          int(market_id),
-            "order_id":           bytes.fromhex(oid_hex),
-        }
-        permit["signature"] = self._sign_typed_b64_compact(
-            _CANCEL_PERMIT_TYPES, _CANCEL_PERMIT_PRIMARY, msg,
+        anchor, bitmap = self.adjust_nonce_for_bitmap_rollover(
+            int(nonce_anchor), int(nonce_bitmap_index),
         )
-        return permit
+        h = encode_cancel_order_hash(
+            market_id=market_id, resting_order_id=resting_order_id,
+        )
+        sig_b64 = self._sign_witness_b64(
+            h, nonce_anchor=anchor, nonce_bitmap_index=bitmap, deadline=deadline,
+        )
+        return self._v3_permit(
+            nonce_anchor=anchor, nonce_bitmap_index=bitmap,
+            deadline=deadline, signature_b64=sig_b64,
+        )
 
-    def sign_cancel_all_permit(self, market_id: int,
+    def sign_cancel_all_permit(self, *, market_id: int,
                                  nonce_anchor: int, nonce_bitmap_index: int,
-                                 deadline_secs: int = 3600) -> dict[str, Any]:
+                                 deadline_secs: int = 7 * 24 * 3600,
+                               ) -> dict[str, Any]:
         deadline = self.deadline_in(deadline_secs)
-        permit = self._envelope(nonce_anchor, nonce_bitmap_index, deadline)
-        msg = {
-            "account":            self.account_address,
-            "signer":             self.signer_address,
-            "nonce_anchor":       int(nonce_anchor),
-            "nonce_bitmap_index": int(nonce_bitmap_index),
-            "deadline":           int(deadline),
-            "market_id":          int(market_id),
-        }
-        permit["signature"] = self._sign_typed_b64_compact(
-            _CANCEL_ALL_PERMIT_TYPES, _CANCEL_ALL_PERMIT_PRIMARY, msg,
+        anchor, bitmap = self.adjust_nonce_for_bitmap_rollover(
+            int(nonce_anchor), int(nonce_bitmap_index),
         )
-        return permit
+        h = encode_cancel_all_hash(market_id=market_id)
+        sig_b64 = self._sign_witness_b64(
+            h, nonce_anchor=anchor, nonce_bitmap_index=bitmap, deadline=deadline,
+        )
+        return self._v3_permit(
+            nonce_anchor=anchor, nonce_bitmap_index=bitmap,
+            deadline=deadline, signature_b64=sig_b64,
+        )
 
 
 # ---- REST client --------------------------------------------------------
@@ -599,6 +704,30 @@ class RiseRest:
     async def get_eip712_domain(self) -> dict:
         return self._unwrap(await self._get("/v1/auth/eip712-domain"))
 
+    async def get_system_config(self) -> dict:
+        """Fetch contract addresses, including the router/orders_manager
+        used as `target` in VerifyWitness permits."""
+        return self._unwrap(await self._get("/v1/system/config"))
+
+    async def fetch_and_set_target(self) -> str:
+        """Fetch /v1/system-config and set signer.target_address to the
+        router (or orders_manager / perps_manager as fallback). Returns
+        the resolved address."""
+        cfg = await self.get_system_config()
+        addrs = cfg.get("addresses") or {}
+        target = (
+            addrs.get("router")
+            or (addrs.get("perp_v2") or {}).get("orders_manager")
+            or (cfg.get("contract_addresses") or {}).get("perps_manager")
+        )
+        if not target:
+            raise RiseRestError(
+                500, "Could not find router/orders_manager in system config",
+                cfg,
+            )
+        self.signer.set_target(target)
+        return target
+
     async def get_nonce_state(self, account: str) -> tuple[int, int]:
         """Fetch the current (nonce_anchor, current_bitmap_index) for an
         account from Rise's auth contract via the REST proxy. Each
@@ -642,56 +771,90 @@ class RiseRest:
     # ---- orders -----------------------------------------------------
     async def place_order(self, *, market_id: int, side: int,
                             size_steps: int, price_ticks: int,
-                            client_order_id: int,
                             post_only: bool = True,
                             reduce_only: bool = False,
                             time_in_force: int = 0,    # 0=GTC
-                            order_type: int = 1,        # 1=Limit
-                            stp_mode: int = 0,          # 0=ExpireMaker
+                            order_type: int = 1,        # 0=Market, 1=Limit
+                            stp_mode: int = 0,
                             ttl_units: int = 0,
+                            client_order_id: int = 0,
                             builder_id: int = 0,
                             no_retry: bool = False) -> dict:
-        order_fields = {
-            "market_id":       market_id,
-            "side":            side,
-            "size_steps":      size_steps,
-            "price_ticks":     price_ticks,
-            "post_only":       post_only,
-            "reduce_only":     reduce_only,
-            "stp_mode":        stp_mode,
-            "order_type":      order_type,
-            "time_in_force":   time_in_force,
-            "client_order_id": client_order_id,
-            "ttl_units":       ttl_units,
-            "builder_id":      builder_id,
-        }
-        # Fetch server-issued nonce state for this account, then sign.
+        """Place an order. Hash is computed over (size_steps, price_ticks)
+        directly per the risex-client SDK encodeOrder."""
         anchor, bitmap = await self.get_nonce_state(self.signer.account_address)
-        permit = self.signer.sign_order_permit(order_fields, anchor, bitmap)
-        body = dict(order_fields)
-        body["client_order_id"] = str(client_order_id)
-        body["permit"] = permit
-        body["no_retry"] = no_retry
+        permit = self.signer.sign_order_permit(
+            market_id=market_id, size_steps=size_steps, price_ticks=price_ticks,
+            side=side, post_only=post_only, reduce_only=reduce_only,
+            stp_mode=stp_mode, order_type=order_type,
+            time_in_force=time_in_force, ttl_units=ttl_units,
+            builder_id=builder_id, client_order_id=client_order_id,
+            nonce_anchor=anchor, nonce_bitmap_index=bitmap,
+        )
+        body = {
+            "market_id":       int(market_id),
+            "side":            int(side),
+            "size_steps":      int(size_steps),
+            "price_ticks":     int(price_ticks),
+            "post_only":       bool(post_only),
+            "reduce_only":     bool(reduce_only),
+            "stp_mode":        int(stp_mode),
+            "order_type":      int(order_type),
+            "time_in_force":   int(time_in_force),
+            "ttl_units":       int(ttl_units),
+            "client_order_id": str(client_order_id),
+            "builder_id":      int(builder_id),
+            "permit":          permit,
+        }
+        if no_retry:
+            body["no_retry"] = True
         return await self._post("/v1/orders/place", body)
 
-    async def cancel_order(self, market_id: int, order_id: str,
+    async def cancel_order(self, *, market_id: int, order_id: int | str,
+                            resting_order_id: int | None = None,
                             no_retry: bool = False) -> dict:
+        """Cancel an order. resting_order_id is the uint64 the signature
+        commits to. If omitted, looked up via /v1/orders/open by matching
+        order_id — exactly how risex-client does it."""
+        if resting_order_id is None:
+            open_resp = await self.get_open_orders(
+                account=self.signer.account_address, market_id=market_id,
+            )
+            orders = open_resp.get("orders") or open_resp.get("data", {}).get("orders") or []
+            order_id_str = str(order_id)
+            match = next((o for o in orders if str(o.get("order_id")) == order_id_str), None)
+            if not match or not match.get("resting_order_id"):
+                raise RiseRestError(
+                    400,
+                    f"Could not find resting_order_id for order {order_id_str}. "
+                    f"Pass it explicitly or ensure the order is still open.",
+                    {"open_count": len(orders)},
+                )
+            resting_order_id = int(match["resting_order_id"])
         anchor, bitmap = await self.get_nonce_state(self.signer.account_address)
-        permit = self.signer.sign_cancel_permit(market_id, order_id, anchor, bitmap)
-        return await self._post("/v1/orders/cancel", {
-            "market_id": market_id,
-            "order_id":  order_id,
+        permit = self.signer.sign_cancel_permit(
+            market_id=market_id, resting_order_id=resting_order_id,
+            nonce_anchor=anchor, nonce_bitmap_index=bitmap,
+        )
+        body = {
+            "market_id": int(market_id),
+            "order_id":  str(order_id),
             "permit":    permit,
-            "no_retry":  no_retry,
-        })
+            "no_retry":  bool(no_retry),
+        }
+        return await self._post("/v1/orders/cancel", body)
 
     async def cancel_all_orders(self, market_id: int) -> dict:
         anchor, bitmap = await self.get_nonce_state(self.signer.account_address)
-        permit = self.signer.sign_cancel_all_permit(market_id, anchor, bitmap)
-        return await self._post("/v1/orders/cancel-all", {
-            "market_id": str(market_id),
+        permit = self.signer.sign_cancel_all_permit(
+            market_id=market_id,
+            nonce_anchor=anchor, nonce_bitmap_index=bitmap,
+        )
+        body = {
+            "market_id": int(market_id),
             "permit":    permit,
-        })
+        }
+        return await self._post("/v1/orders/cancel-all", body)
 
 
 # ---- WebSocket helpers --------------------------------------------------
