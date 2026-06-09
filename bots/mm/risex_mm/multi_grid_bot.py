@@ -124,6 +124,21 @@ PAIRS_INCLUDE_RAW       = (os.environ.get("PAIRS_INCLUDE") or "").strip()
 ORDER_SIZE_USD          = _env_float("ORDER_SIZE_USD", 50.0)
 LEVELS_PER_SIDE         = max(1, _env_int("LEVELS_PER_SIDE", 3))
 GRID_STEP_BP            = _env_float("GRID_STEP_BP", 8.0)
+# Optional per-level grid offsets, in basis points. If set, this list
+# takes precedence over GRID_STEP_BP × LEVELS_PER_SIDE arithmetic — each
+# entry becomes one level's distance from mid (same on bid and ask).
+# Example: LEVEL_OFFSETS_BP=12,40 → L1 at 12bp, L2 at 40bp.
+def _parse_level_offsets(raw: str | None) -> list[float]:
+    if not raw: return []
+    out = []
+    for tok in raw.replace(";", ",").split(","):
+        tok = tok.strip()
+        if not tok: continue
+        try: out.append(float(tok))
+        except ValueError: return []
+    return out
+
+LEVEL_OFFSETS_BP        = _parse_level_offsets(os.environ.get("LEVEL_OFFSETS_BP"))
 MAX_NOTIONAL_PER_PAIR_USD = _env_float("MAX_NOTIONAL_PER_PAIR_USD", 500.0)
 MAX_TOTAL_NOTIONAL_USD    = _env_float("MAX_TOTAL_NOTIONAL_USD", 2000.0)
 REQUOTE_DRIFT_BP        = _env_float("REQUOTE_DRIFT_BP", 4.0)
@@ -178,6 +193,23 @@ def _live_int(k: str, default: int) -> int:
     v = _LIVE.get(k, default)
     try: return int(v)
     except (TypeError, ValueError): return default
+
+def _live_csv_floats(k: str, default: list[float] | None = None) -> list[float]:
+    """Parse a CSV/spaced list of floats from live config or env-derived
+    default. Used for per-level grid offset overrides like '12,40'."""
+    v = _LIVE.get(k, default)
+    if v is None or v == "":
+        return list(default or [])
+    if isinstance(v, (list, tuple)):
+        try: return [float(x) for x in v]
+        except (TypeError, ValueError): return list(default or [])
+    out: list[float] = []
+    for tok in str(v).replace(";", ",").split(","):
+        tok = tok.strip()
+        if not tok: continue
+        try: out.append(float(tok))
+        except ValueError: return list(default or [])
+    return out
 
 
 # ---- state ---------------------------------------------------------------
@@ -814,12 +846,16 @@ def _csv_trade_log(market: str, side: str, size: float, price: float,
 async def place_order(rest: RiseRest | None, meta: MarketMeta,
                        coid: int, size_steps: int, price_ticks: int,
                        is_buy: bool, st: State,
-                       log: logging.Logger) -> tuple[bool, str, str]:
+                       log: logging.Logger,
+                       reduce_only: bool = False) -> tuple[bool, str, str]:
     """Submit a POST_ONLY limit order. Returns (ok, info, order_id).
 
     Hash is computed over (size_steps, price_ticks) per risex-client's
     encodeOrder. client_order_id is passed through so the contract can
     bind the signature to it (also enables V3_FLAG_CLIENT_ID).
+
+    reduce_only: when True, the venue must reject the order if it would
+    grow the position. Used by pair_exit_only / over-cap paths.
     """
     if rest is None:
         return True, "dry_run", ""
@@ -830,6 +866,7 @@ async def place_order(rest: RiseRest | None, meta: MarketMeta,
             size_steps=size_steps,
             price_ticks=price_ticks,
             post_only=True,
+            reduce_only=bool(reduce_only),
             order_type=1,        # Limit
             time_in_force=0,     # GTC
             stp_mode=0,          # ExpireMaker
@@ -938,9 +975,19 @@ def desired_orders(meta: MarketMeta, ps: PairState, exit_only: bool = False,
 
     out: list[tuple[int, bool, int, int, float]] = []
     cap_base = cap_per_pair / mid
-    n_levels = _live_int("levels_per_side", LEVELS_PER_SIDE)
+    # Per-level offsets: explicit list wins over uniform spacing.
+    # Live-tunable via dashboard POST /config {"level_offsets_bp":"12,40"}.
+    offsets = _live_csv_floats("level_offsets_bp", LEVEL_OFFSETS_BP)
+    if offsets:
+        # Cap by levels_per_side so a stale offset list doesn't blow up
+        # the order count beyond what the slot encoding can address.
+        n_levels  = min(len(offsets), _live_int("levels_per_side", LEVELS_PER_SIDE))
+        level_bps = offsets[:n_levels]
+    else:
+        n_levels  = _live_int("levels_per_side", LEVELS_PER_SIDE)
+        level_bps = [(k + 1) * grid_step_bp for k in range(n_levels)]
     for k in range(1, n_levels + 1):
-        bp = k * grid_step_bp
+        bp = level_bps[k - 1]
         bid_px = mid * (1 - bp / 10_000.0)
         ask_px = mid * (1 + bp / 10_000.0)
         if ps.bbo.ask_px is not None and bid_px >= ps.bbo.ask_px:
@@ -1010,19 +1057,48 @@ def compute_directional_delta(st: State) -> dict[str, Any]:
 
 def evaluate_pair_halt(ps: PairState, st: State, now_ms: int,
                         sym: str) -> str | None:
+    """Conditions that fully halt the pair (can't quote at all).
+    Reserved for cases where the bot can't make a reasoned price:
+    missing book, stale book. Anything else that "wants" the bot to
+    stop adding inventory should be a soft exit-only trigger instead
+    (see evaluate_pair_exit_only) so the bot keeps unwinding rather
+    than freezing on top of bad inventory."""
     if ps.bbo.mid is None:
         return "no_book"
     if (now_ms - ps.bbo.updated_ms) > MAX_FV_AGE_SEC * 1000:
         return "book_stale"
-    if ps.halt_reason and ps.halt_reason.startswith(("pair_stop_loss", "fill_imbalance")):
-        return ps.halt_reason
-    pair_stop_loss  = _live_float("pair_stop_loss_usd",       PAIR_STOP_LOSS_USD)
-    imbalance_ratio = _live_float("fill_imbalance_ratio",     FILL_IMBALANCE_RATIO)
-    imbalance_min   = _live_int  ("fill_imbalance_min_fills", FILL_IMBALANCE_MIN_FILLS)
+    return None
+
+
+def evaluate_pair_exit_only(ps: PairState, st: State, sym: str) -> str | None:
+    """Return a reason string if this pair should quote ONLY on the side
+    that reduces inventory (exit_only), otherwise None.
+
+    Triggers (any of):
+      - over_cap        — |position_value| > 1.25 × per-pair cap.
+      - pair_stop_loss  — session realized PnL ≤ PAIR_STOP_LOSS_USD.
+      - fill_imbalance  — fills heavily one-sided, trend-following risk.
+
+    All of these mean "stop adding inventory but keep trying to get
+    out". A full halt here would freeze the bot on top of a losing
+    position — strictly worse than reduce-only quoting that grinds
+    inventory back down."""
+    # Over-cap
+    cap_per_pair = _live_float("max_notional_per_pair", MAX_NOTIONAL_PER_PAIR_USD)
+    if cap_per_pair > 0:
+        pos_value = abs(ps.position_value)
+        breach_at = cap_per_pair * 1.25
+        if pos_value > breach_at:
+            return f"over_cap(${pos_value:.0f}>${breach_at:.0f})"
+    # Pair stop-loss
+    pair_stop_loss = _live_float("pair_stop_loss_usd", PAIR_STOP_LOSS_USD)
     baseline = st.realized_baseline.get(sym, 0.0)
     sess_realized = ps.realized_pnl - baseline
     if pair_stop_loss < 0 and sess_realized <= pair_stop_loss:
         return f"pair_stop_loss({sess_realized:+.2f})"
+    # Fill imbalance
+    imbalance_ratio = _live_float("fill_imbalance_ratio",     FILL_IMBALANCE_RATIO)
+    imbalance_min   = _live_int  ("fill_imbalance_min_fills", FILL_IMBALANCE_MIN_FILLS)
     total_fills = ps.fills_buy + ps.fills_sell
     if total_fills >= imbalance_min:
         dom = max(ps.fills_buy, ps.fills_sell)
@@ -1103,7 +1179,21 @@ async def reconcile_pair(sym: str, ps: PairState, meta: MarketMeta,
         log.info(f"{sym} resume (was: {ps.halt_reason})")
         ps.halt_reason = None
 
-    desired = desired_orders(meta, ps, exit_only=exit_only)
+    # Soft exit-only: over-cap, pair-stop-loss, or fill imbalance →
+    # keep the bot active but force reduce_only one-sided quotes that
+    # only ever shrink the position. Better than full halt: the bot
+    # actively works the inventory back down instead of freezing on
+    # top of bad positions.
+    soft_reason   = evaluate_pair_exit_only(ps, st, sym)
+    pair_exit_only = exit_only or (soft_reason is not None)
+    if soft_reason and getattr(ps, "_exit_only_logged", None) != soft_reason:
+        log.warning(f"{sym} → exit-only mode: {soft_reason}")
+        ps._exit_only_logged = soft_reason
+    elif soft_reason is None and getattr(ps, "_exit_only_logged", None):
+        log.info(f"{sym} cleared exit-only, resuming two-sided quotes")
+        ps._exit_only_logged = None
+
+    desired = desired_orders(meta, ps, exit_only=pair_exit_only)
     desired_by_slot = {d[0]: d for d in desired}
 
     # Cancel resting levels no longer in target.
@@ -1154,8 +1244,12 @@ async def reconcile_pair(sym: str, ps: PairState, meta: MarketMeta,
 
         await _throttle_signed_op(st)
         coid = _make_coid(st, market_idx, slot)
+        # When we're in pair_exit_only (over-cap or global exit_only),
+        # use reduce_only=True so the order can ONLY shrink the position,
+        # never grow it. The exchange will reject overshoots.
         ok, info_msg, order_id = await place_order(
             rest, meta, coid, size_steps, price_ticks, is_buy, st, log,
+            reduce_only=pair_exit_only,
         )
         if ok:
             now_ms_p = int(time.time() * 1000)
@@ -1218,6 +1312,15 @@ async def quote_loop(st: State, rest: RiseRest | None,
             live_unreal = ps.unrealized_pnl
             if ps.bbo.mid is not None and ps.position != 0 and ps.avg_entry > 0:
                 live_unreal = ps.position * (ps.bbo.mid - ps.avg_entry)
+            # Count resting orders per level: slot ≤ N is a bid, slot > N is an ask.
+            # We expose L1/L2/L3 separately so the dashboard can show ladder health.
+            n_per_side = _live_int("levels_per_side", LEVELS_PER_SIDE)
+            level_counts: dict[str, int] = {}
+            for slot in ps.levels.keys():
+                lvl_idx = slot if slot <= n_per_side else slot - n_per_side
+                side    = "bid" if slot <= n_per_side else "ask"
+                key     = f"L{lvl_idx}_{side}"
+                level_counts[key] = level_counts.get(key, 0) + 1
             ex_pnl[sym] = {
                 "position":          ps.position,
                 "avg_entry":         ps.avg_entry,
@@ -1226,6 +1329,8 @@ async def quote_loop(st: State, rest: RiseRest | None,
                 "realized_pnl":      round(ps.realized_pnl, 4),
                 "realized_session":  round(ps.realized_pnl - baseline, 4),
                 "position_value":    ps.position_value,
+                "level_counts":      level_counts,   # e.g. {"L1_bid":1,"L1_ask":1,"L2_bid":1,"L2_ask":1}
+                "n_levels":          n_per_side,
             }
             try:
                 await reconcile_pair(
@@ -1461,6 +1566,9 @@ async def main():
                 "order_size_usd":            ORDER_SIZE_USD,
                 "levels_per_side":           LEVELS_PER_SIDE,
                 "grid_step_bp":              GRID_STEP_BP,
+                # Per-level offset overrides (CSV string e.g. "12,40").
+                # Empty string = use uniform GRID_STEP_BP × k spacing.
+                "level_offsets_bp":          ",".join(str(x) for x in LEVEL_OFFSETS_BP),
                 "max_notional_per_pair":     MAX_NOTIONAL_PER_PAIR_USD,
                 "max_total_notional":        MAX_TOTAL_NOTIONAL_USD,
                 "requote_drift_bp":          REQUOTE_DRIFT_BP,

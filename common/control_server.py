@@ -651,6 +651,9 @@ async def run_control_server(state: BotState, port: int, host: str = "0.0.0.0") 
         "order_size_usd":             float,
         "levels_per_side":            int,
         "grid_step_bp":               float,
+        # Per-level offset overrides as CSV string, e.g. "14,40".
+        # Empty string falls back to GRID_STEP_BP × k uniform spacing.
+        "level_offsets_bp":           str,
         "max_notional_per_pair":      float,
         "max_total_notional":         float,
         "requote_drift_bp":           float,

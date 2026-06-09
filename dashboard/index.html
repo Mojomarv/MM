@@ -290,11 +290,12 @@ tbody tr:last-child td { border-bottom: 0; }
           <th data-sort="unrealized" class="num">Unreal.</th>
           <th data-sort="realized_session" class="num">Real. (sess)</th>
           <th data-sort="realized"   class="num">Real. (all)</th>
+          <th class="num" title="Resting orders by level: bid/ask">Levels</th>
           <th data-sort="bbo_spread" class="num">Sprd&nbsp;bp</th>
           <th data-sort="halt">Halt</th>
         </tr></thead>
         <tbody id="pairsTbody">
-          <tr><td colspan="10" class="skeleton" style="padding:20px;text-align:center">
+          <tr><td colspan="11" class="skeleton" style="padding:20px;text-align:center">
             waiting for first /status…
           </td></tr>
         </tbody>
@@ -556,6 +557,8 @@ function renderPairs(s) {
       unrealized: e.unrealized_pnl,
       realized_session: e.realized_session,
       realized:  e.realized_pnl,
+      level_counts: e.level_counts || {},
+      n_levels:  e.n_levels || 0,
       halt:      e.halt_reason || '',  // future: bot can publish per-pair halts
     };
   });
@@ -582,10 +585,27 @@ function renderPairs(s) {
       <td class="num mono ${cls(r.unrealized)}">${fmtUsd(r.unrealized)}</td>
       <td class="num mono ${cls(r.realized_session)}">${fmtUsd(r.realized_session)}</td>
       <td class="num mono dim">${fmtUsd(r.realized)}</td>
+      <td class="num mono">${fmtLevels(r.level_counts, r.n_levels)}</td>
       <td class="num mono ${r.bbo_spread != null && r.bbo_spread > 30 ? 'pos-negative' : 'dim'}">${fmtBP(r.bbo_spread)}</td>
       <td class="halt-cell">${r.halt}</td>
     </tr>
   `).join('');
+}
+
+// Render per-level resting-order counts as "L1:b/a  L2:b/a", with each
+// b/a showing the live bid/ask count vs the expected 1/1 (gray = ok,
+// orange = missing, green when we have orders on both sides).
+function fmtLevels(counts, n_levels) {
+  if (!n_levels) return '<span class="dim">—</span>';
+  const parts = [];
+  for (let k = 1; k <= n_levels; k++) {
+    const b = counts[`L${k}_bid`] || 0;
+    const a = counts[`L${k}_ask`] || 0;
+    const ok = (b > 0 && a > 0);
+    const col = ok ? 'pos-positive' : (b + a === 0 ? 'dim' : '');
+    parts.push(`<span class="${col}">L${k}:${b}/${a}</span>`);
+  }
+  return parts.join('&nbsp;&nbsp;');
 }
 
 function renderFills(s) {
@@ -617,6 +637,7 @@ const TUNABLES = [
   ['order_size_usd',            'Order size ($)',            'any'],
   ['levels_per_side',           'Levels per side ⚠',         '1'],
   ['grid_step_bp',              'Grid step (bp)',             'any'],
+  ['level_offsets_bp',          'Level offsets bp (e.g. 14,40)', 'csv'],
   ['max_notional_per_pair',     'Max notional / pair ($)',   'any'],
   ['max_total_notional',        'Max total notional ($)',     'any'],
   ['requote_drift_bp',          'Requote drift (bp)',         'any'],
@@ -639,10 +660,15 @@ function renderTune(s) {
   grid.innerHTML = TUNABLES.map(([k, label, step]) => {
     const cur = g[k];
     const val = cur === undefined || cur === null ? '' : cur;
+    // CSV-typed fields (e.g. per-level offsets) use a text input;
+    // numeric fields keep the spinner UX.
+    const isCsv = step === 'csv';
+    const inputType = isCsv ? 'text' : 'number';
+    const stepAttr  = isCsv ? '' : `step="${step}"`;
     return `
       <div class="tune-row">
         <div class="tune-label">${label}</div>
-        <input type="number" step="${step}" name="${k}"
+        <input type="${inputType}" ${stepAttr} name="${k}" data-csv="${isCsv}"
                value="${val}" data-orig="${val}"
                oninput="onTuneChange()">
         <div class="tune-hint" data-key="${k}">unchanged</div>
@@ -683,7 +709,10 @@ async function saveTune() {
   document.querySelectorAll('#tuneGrid input').forEach(inp => {
     const cur = inp.value.trim();
     if (cur !== '' && cur !== inp.dataset.orig) {
-      payload[inp.name] = parseFloat(cur);
+      // CSV inputs send the raw string (e.g. "14,40"); numeric inputs
+      // are coerced to float so the control server's whitelist check
+      // accepts them.
+      payload[inp.name] = inp.dataset.csv === 'true' ? cur : parseFloat(cur);
     }
   });
   if (Object.keys(payload).length === 0) return;
