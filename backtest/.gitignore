@@ -1,3 +1,4 @@
-# Regenerable cache — re-fetch with fetch_data.py
+# Regenerable cache -- re-fetch with fetch_data.py / binance_fetch.py
 data/
 results.csv
+combo_results.csv
